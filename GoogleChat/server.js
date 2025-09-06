@@ -1,19 +1,21 @@
-// Google Chat Bot (Push-only, no ngrok needed)
-// Install: npm install express googleapis dotenv cors
+import express from "express";
+import { google } from "googleapis";
+import dotenv from "dotenv";
+import cors from "cors";
+import fs from "fs";
+import axios from "axios";
+import { AgentManager } from "./agents/agentManager.js";
 
-const express = require("express");
-const { google } = require("googleapis");
-require("dotenv").config();
-const cors = require("cors");
-const fs = require("fs");
+dotenv.config();
 
 const app = express();
 app.use(express.json());
 app.use(cors());
 
-// ====== Service Account Config ======
+const PORT = process.env.PORT || 3005;
 const SERVICE_ACCOUNT_FILE =
   process.env.SERVICE_ACCOUNT_KEY_FILE || "./service-account-key.json";
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // <-- You set this in .env
 
 const SCOPES = [
   "https://www.googleapis.com/auth/chat.bot",
@@ -21,7 +23,7 @@ const SCOPES = [
   "https://www.googleapis.com/auth/chat.spaces",
 ];
 
-// Load service account
+// ====== Google Auth Setup ======
 let auth;
 try {
   const serviceAccountKey = JSON.parse(
@@ -32,26 +34,75 @@ try {
     scopes: SCOPES,
   });
 } catch (error) {
-  console.error("Error loading service account:", error.message);
+  console.error("❌ Error loading service account:", error.message);
   process.exit(1);
 }
 
-// Init Chat API
 const chat = google.chat({ version: "v1", auth });
 
-// Helper: get auth client
+// Initialize the multi-agent system
+const agentManager = new AgentManager();
+
 async function getAuthClient() {
   return await auth.getClient();
 }
 
-// ========= ROUTES ===========
+// ====== Gemini Flash 1.5 Integration ======
+
+async function getGeminiReply(userMessage) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("Gemini API key not set in environment variable.");
+  }
+
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`;
+
+  try {
+    const response = await axios.post(endpoint, {
+      contents: [{ role: "user", parts: [{ text: userMessage }] }],
+    });
+
+    const text = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    return text || "Sorry, I couldn’t understand that.";
+  } catch (err) {
+    console.error("❌ Error fetching Gemini response:", err.message);
+    return "Something went wrong when contacting the AI model.";
+  }
+}
+
+// ====== Shared Utility (Unused here, kept for reference) ======
+async function sendMessageToUser(userEmail, messageText) {
+  const authClient = await getAuthClient();
+
+  const spaces = await chat.spaces.list({ auth: authClient, pageSize: 100 });
+  const dmSpace = (spaces.data.spaces || []).find(
+    (s) =>
+      s.spaceType === "DIRECT_MESSAGE" &&
+      s.singleUserBotDm?.user?.email === userEmail
+  );
+
+  if (!dmSpace) {
+    throw new Error(
+      `No DM space found with ${userEmail}. Ask them to message the bot first.`
+    );
+  }
+
+  const response = await chat.spaces.messages.create({
+    auth: authClient,
+    parent: dmSpace.name,
+    requestBody: { text: messageText },
+  });
+
+  return { result: response.data, space: dmSpace.name };
+}
+
+// ====== Routes ======
 
 // Health check
 app.get("/", (req, res) => {
   res.json({ success: true, message: "Bot is running" });
 });
 
-// 1. List all spaces the bot is in
+// List spaces
 app.get("/chat/spaces", async (req, res) => {
   try {
     const authClient = await getAuthClient();
@@ -65,11 +116,12 @@ app.get("/chat/spaces", async (req, res) => {
       spaces: spaces.data.spaces || [],
     });
   } catch (error) {
+    console.error("❌ Error listing spaces:", error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// 2. Send a message to an existing space (DM or room)
+// Send message to space
 app.post("/chat/send", async (req, res) => {
   const { spaceName, message } = req.body;
 
@@ -89,11 +141,12 @@ app.post("/chat/send", async (req, res) => {
 
     res.json({ success: true, result: response.data });
   } catch (error) {
+    console.error("❌ Error sending message to space:", error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// 3. Shortcut: Send to user (only if DM already exists)
+// Send to user
 app.post("/chat/send-to-user", async (req, res) => {
   const { userEmail, message } = req.body;
 
@@ -104,43 +157,162 @@ app.post("/chat/send-to-user", async (req, res) => {
   }
 
   try {
-    const authClient = await getAuthClient();
-
-    // Find DM space with this user
-    const spaces = await chat.spaces.list({ auth: authClient, pageSize: 100 });
-    const dmSpace = (spaces.data.spaces || []).find(
-      (s) =>
-        s.spaceType === "DIRECT_MESSAGE" &&
-        s.singleUserBotDm?.user?.email === userEmail
-    );
-
-    if (!dmSpace) {
-      return res.status(400).json({
-        success: false,
-        error: `No DM space found with ${userEmail}. Ask them to message the bot first.`,
-      });
-    }
-
-    const response = await chat.spaces.messages.create({
-      auth: authClient,
-      parent: dmSpace.name,
-      requestBody: { text: message },
-    });
-
-    res.json({ success: true, result: response.data, space: dmSpace.name });
+    const result = await sendMessageToUser(userEmail, message);
+    res.json({ success: true, ...result });
   } catch (error) {
+    console.error("❌ Error sending to user:", error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-// ====== START SERVER ======
-const PORT = process.env.PORT || 3000;
+// Get leave application status
+app.get("/leave/status/:applicationId", async (req, res) => {
+  const { applicationId } = req.params;
+
+  try {
+    const status = agentManager.getApplicationStatus(applicationId);
+    if (!status) {
+      return res.status(404).json({
+        success: false,
+        error: "Application not found",
+      });
+    }
+
+    res.json({ success: true, application: status });
+  } catch (error) {
+    console.error("❌ Error getting application status:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Get all leave applications (admin endpoint)
+app.get("/leave/applications", async (req, res) => {
+  try {
+    const applications = agentManager.getAllApplications();
+    res.json({ success: true, applications });
+  } catch (error) {
+    console.error("❌ Error getting applications:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Reset user state (for testing)
+app.post("/chat/reset-user", async (req, res) => {
+  const { userEmail } = req.body;
+
+  if (!userEmail) {
+    return res
+      .status(400)
+      .json({ success: false, error: "userEmail required" });
+  }
+
+  try {
+    agentManager.resetUserState(userEmail);
+    res.json({ success: true, message: "User state reset successfully" });
+  } catch (error) {
+    console.error("❌ Error resetting user state:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// Webhook handler
+app.post("/chat/webhook", async (req, res) => {
+  const event = req.body;
+
+  console.log("🔔 Incoming webhook event:", JSON.stringify(event, null, 2));
+  res.status(200).json({}); // Always respond immediately
+
+  const spaceName = event?.chat?.messagePayload?.space?.name;
+  const messageText = event?.chat?.messagePayload?.message?.text;
+  const senderEmail = event?.chat?.messagePayload?.message?.sender?.email;
+
+  if (!spaceName || !messageText) {
+    console.warn("⚠️ No space name or message text found in event");
+    return;
+  }
+
+  // Skip processing if the message is from the bot itself
+  if (event?.chat?.messagePayload?.message?.sender?.type === "BOT") {
+    console.log("🤖 Skipping bot message");
+    return;
+  }
+
+  try {
+    console.log(
+      `💡 Processing message with multi-agent system: "${messageText}"`
+    );
+
+    // Process message with the multi-agent system
+    const agentResult = await agentManager.processMessage(
+      messageText,
+      senderEmail
+    );
+
+    if (agentResult.success) {
+      console.log(`💬 Sending agent response to ${spaceName}...`);
+      await axios.post(`http://localhost:${PORT}/chat/send`, {
+        spaceName,
+        message: agentResult.message,
+      });
+
+      console.log(`✅ Replied to ${spaceName} with agent response.`);
+
+      // Log additional details for leave applications
+      if (agentResult.applicationId) {
+        console.log(
+          `📋 Leave application processed - ID: ${agentResult.applicationId}, Status: ${agentResult.status}`
+        );
+      }
+    } else {
+      console.error("❌ Agent processing failed:", agentResult.error);
+
+      // Send error message to user
+      await axios.post(`http://localhost:${PORT}/chat/send`, {
+        spaceName,
+        message:
+          agentResult.message ||
+          "I'm sorry, I encountered an error. Please try again.",
+      });
+    }
+  } catch (error) {
+    console.error("❌ Failed to process webhook:", error.message);
+
+    // Send fallback error message
+    try {
+      await axios.post(`http://localhost:${PORT}/chat/send`, {
+        spaceName,
+        message:
+          "I'm sorry, I'm having trouble processing your request right now. Please try again later.",
+      });
+    } catch (sendError) {
+      console.error("❌ Failed to send error message:", sendError.message);
+    }
+  }
+});
+
+// ====== Start server ======
 app.listen(PORT, () => {
-  console.log(`🚀 Bot running at http://localhost:${PORT}`);
-  console.log("Endpoints:");
-  console.log("   GET  /chat/spaces        → List spaces");
-  console.log("   POST /chat/send          → Send to a space");
   console.log(
-    "   POST /chat/send-to-user  → Send to a user (requires DM exists)"
+    `🚀 Multi-Agent Workplace Bot running at http://localhost:${PORT}`
   );
+  console.log("🤖 Agents initialized:");
+  console.log("   - Main Agent (Conversational Router)");
+  console.log("   - Leave Agent (LangGraph Workflow)");
+  console.log("");
+  console.log("📡 Endpoints:");
+  console.log("   GET  /chat/spaces           → List spaces");
+  console.log("   POST /chat/send             → Send to a space");
+  console.log(
+    "   POST /chat/send-to-user     → Send to a user (DM must exist)"
+  );
+  console.log("   POST /chat/webhook          → Handle incoming messages");
+  console.log("   GET  /leave/status/:id      → Get leave application status");
+  console.log("   GET  /leave/applications    → Get all applications (admin)");
+  console.log("   POST /chat/reset-user       → Reset user state (testing)");
+  console.log("");
+  console.log("💬 The bot is ready to handle:");
+  console.log("   - General workplace conversations");
+  console.log("   - Leave application processing");
+  console.log("   - Calendar conflict checking");
+  console.log("   - Approval workflow simulation");
 });

@@ -1,0 +1,39 @@
+############################################
+# Stable dependencies for Python 3.11
+# Pinned to avoid Rust builds and breakage
+############################################
+
+# Core FastAPI and server
+fastapi==0.110.0
+uvicorn[standard]==0.24.0
+
+# Google services
+google-auth==2.29.0
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==2.126.0
+
+# Google Generative AI (aligned with langchain-google-genai 2.x)
+google-generativeai==0.8.3
+
+# LangChain ecosystem (aligned versions for compatibility)
+langchain==0.3.7
+langchain-core==0.3.21
+langchain-google-genai==2.0.5
+langgraph==0.2.39
+
+# HTTP and async
+httpx==0.27.0
+aiohttp==3.9.5
+
+# Data handling
+pydantic==2.8.2
+pydantic-settings==2.3.4
+
+# Environment and utilities
+python-dotenv==1.0.1
+python-multipart==0.0.9
+typing-extensions==4.12.2
+
+# Optional: Faster JSON (has wheels for win_amd64)
+orjson==3.10.7
