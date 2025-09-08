@@ -21,9 +21,13 @@ class AgentManager:
                 main_agent_result.get("leaveData")):
                 print("📋 Leave data complete, invoking Leave Agent...")
                 
+                # Extracted leave data for debugging
+                extracted_data = main_agent_result["leaveData"]
+                print("Extracted leave data:", extracted_data)
+                
                 # Process with Leave Agent
                 leave_agent_result = await self.leave_agent.process_leave_application(
-                    main_agent_result["leaveData"]
+                    extracted_data
                 )
                 
                 # Combine results

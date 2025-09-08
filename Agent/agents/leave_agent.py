@@ -241,7 +241,7 @@ Your sick leave has been approved. Take care and get well soon!""",
 - **Duration:** {duration} day(s)
 - **Reason:** {leave_data['reason']}
 
-Your leave application has been submitted and is pending manager approval. You'll receive a notification once it's reviewed.""",
+Your leave application has been submitted and is pending supervisor approval. You'll receive a notification once it's reviewed.""",
             }
         
         except Exception as error:
