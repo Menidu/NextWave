@@ -24,6 +24,10 @@ export class LeaveAgent {
         value: (x, y) => y ?? x,
         default: () => ({}),
       },
+      requesterEmail: {
+        value: (x, y) => y ?? x,
+        default: () => null,
+      },
       applicationId: {
         value: (x, y) => y ?? x,
         default: () => null,
@@ -54,7 +58,7 @@ export class LeaveAgent {
   // Step 1: Validate and create leave application
   async validateAndCreateApplication(state) {
     try {
-      const { leaveData } = state;
+      const { leaveData, requesterEmail } = state;
 
       // Generate unique application ID
       const applicationId = uuidv4();
@@ -81,6 +85,7 @@ export class LeaveAgent {
         ...leaveData,
         submittedAt: new Date().toISOString(),
         status: "pending",
+        requesterEmail: requesterEmail || null,
       };
 
       this.leaveApplications.set(applicationId, application);
@@ -137,13 +142,13 @@ export class LeaveAgent {
         return {
           ...state,
           approvalStatus: "requires_manual_review",
-          finalMessage: `⚠️ **Calendar Conflicts Detected**
+          finalMessage: `⚠️ Calendar conflicts detected
 
 Your leave application has been submitted, but there are some calendar conflicts that need manual review:
 
 ${conflicts.map((conflict) => `- ${conflict}`).join("\n")}
 
-Your application ID is: \`${applicationId}\`
+Application ID: ${applicationId}
 
 A manager will review your request and get back to you within 24 hours.`,
           status: "completed",
@@ -223,53 +228,19 @@ A manager will review your request and get back to you within 24 hours.`,
     const endDate = new Date(leaveData.endDate);
     const duration = Math.ceil((endDate - startDate) / (1000 * 60 * 60 * 24));
 
-    // Auto-approve short casual leaves
-    if (leaveData.leaveType.toLowerCase().includes("casual") && duration <= 2) {
-      return {
-        status: "approved",
-        message: `✅ **Leave Application Approved!**
-
-📅 **Leave Details:**
-- **Start Date:** ${leaveData.startDate}
-- **End Date:** ${leaveData.endDate}
-- **Leave Type:** ${leaveData.leaveType}
-- **Duration:** ${duration} day(s)
-- **Reason:** ${leaveData.reason}
-
-Your leave has been automatically approved. Enjoy your time off!`,
-      };
-    }
-
-    // Auto-approve sick leave
-    if (leaveData.leaveType.toLowerCase().includes("sick")) {
-      return {
-        status: "approved",
-        message: `✅ **Sick Leave Approved!**
-
-📅 **Leave Details:**
-- **Start Date:** ${leaveData.startDate}
-- **End Date:** ${leaveData.endDate}
-- **Leave Type:** ${leaveData.leaveType}
-- **Duration:** ${duration} day(s)
-- **Reason:** ${leaveData.reason}
-
-Your sick leave has been approved. Take care and get well soon!`,
-      };
-    }
-
-    // Require manual approval for other types
+    // Always require manual approval (supervisor action) regardless of type/duration
     return {
       status: "pending_approval",
-      message: `⏳ **Leave Application Submitted**
+      message: `⏳ Leave application submitted
 
-📅 **Leave Details:**
-- **Start Date:** ${leaveData.startDate}
-- **End Date:** ${leaveData.endDate}
-- **Leave Type:** ${leaveData.leaveType}
-- **Duration:** ${duration} day(s)
-- **Reason:** ${leaveData.reason}
+📅 Details
+- Start: ${leaveData.startDate}
+- End: ${leaveData.endDate}
+- Type: ${leaveData.leaveType}
+- Duration: ${duration} day(s)
+- Reason: ${leaveData.reason}
 
-Your leave application has been submitted and is pending manager approval. You'll receive a notification once it's reviewed.`,
+Your leave application has been submitted and is pending supervisor approval. You'll receive a notification once it's reviewed.`,
     };
   }
 
@@ -297,10 +268,11 @@ Your leave application has been submitted and is pending manager approval. You'l
   }
 
   // Main method to process leave application
-  async processLeaveApplication(leaveData) {
+  async processLeaveApplication(leaveData, requesterEmail) {
     try {
       const initialState = {
         leaveData,
+        requesterEmail: requesterEmail || null,
         applicationId: null,
         status: "pending",
         conflicts: [],
@@ -330,6 +302,20 @@ Your leave application has been submitted and is pending manager approval. You'l
         error: error.message,
       };
     }
+  }
+
+  // Update approval status for an application (called from card actions)
+  setApprovalStatus(applicationId, status, approverEmail) {
+    const application = this.leaveApplications.get(applicationId);
+    if (!application) return { success: false, error: "Application not found" };
+
+    application.approvalStatus = status;
+    application.status = status === "approved" ? "completed" : "completed";
+    application.approvedAt = new Date().toISOString();
+    application.approverEmail = approverEmail || null;
+    this.leaveApplications.set(applicationId, application);
+
+    return { success: true, application };
   }
 
   // Get application status

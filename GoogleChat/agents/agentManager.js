@@ -24,7 +24,10 @@ export class AgentManager {
 
         // Process with Leave Agent
         const leaveAgentResult = await this.leaveAgent.processLeaveApplication(
-          mainAgentResult.leaveData
+          {
+            ...mainAgentResult.leaveData,
+          },
+          userEmail
         );
 
         // Combine results

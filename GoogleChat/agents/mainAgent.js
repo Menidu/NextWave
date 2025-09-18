@@ -1,5 +1,9 @@
 import { ChatGoogleGenerativeAI } from "@langchain/google-genai";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import {
+  getSupervisorEmailFor,
+  setSupervisorForUser,
+} from "./userDirectory.js";
 
 export class MainAgent {
   constructor() {
@@ -24,9 +28,18 @@ export class MainAgent {
         conversationHistory: [],
         isCollectingLeaveData: false,
         lastMessage: null,
+        awaitingSupervisorEmail: false,
+        tempSupervisorEmail: null,
       });
     }
     return this.userStates.get(userEmail);
+  }
+
+  // Extract a likely email from free text
+  extractEmail(text) {
+    if (!text) return null;
+    const match = text.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
+    return match ? match[0] : null;
   }
 
   // Classify user intent
@@ -104,7 +117,30 @@ export class MainAgent {
 
   // Generate conversational response
   async generateResponse(userMessage, userState) {
-    const { leaveData, isCollectingLeaveData } = userState;
+    const { leaveData, isCollectingLeaveData, awaitingSupervisorEmail } =
+      userState;
+
+    // Handle pending supervisor email capture first
+    if (awaitingSupervisorEmail) {
+      const email = this.extractEmail(userMessage);
+      if (!email) {
+        return {
+          response:
+            "Please provide your supervisor's email address (e.g., name@company.com).",
+          shouldInvokeLeaveAgent: false,
+          leaveData: leaveData,
+        };
+      }
+      setSupervisorForUser(userState.userEmail, email);
+      userState.awaitingSupervisorEmail = false;
+      userState.tempSupervisorEmail = email;
+      return {
+        response:
+          "Thanks! I saved your supervisor details. Continuing your leave submission...",
+        shouldInvokeLeaveAgent: true,
+        leaveData: { ...leaveData },
+      };
+    }
 
     if (isCollectingLeaveData) {
       // Extract new information
@@ -115,15 +151,30 @@ export class MainAgent {
 
       // Check if all data is complete
       if (this.isLeaveDataComplete(leaveData)) {
+        // Ensure supervisor email is known
+        const existingSupervisor = getSupervisorEmailFor(userState.userEmail);
+        if (!existingSupervisor) {
+          const inlineEmail = this.extractEmail(userMessage);
+          if (inlineEmail) {
+            setSupervisorForUser(userState.userEmail, inlineEmail);
+          } else {
+            userState.awaitingSupervisorEmail = true;
+            return {
+              response: "Before I submit, what's your supervisor's email?",
+              shouldInvokeLeaveAgent: false,
+              leaveData: { ...leaveData },
+            };
+          }
+        }
         userState.isCollectingLeaveData = false;
         return {
           response: `Perfect! I have all the information needed for your leave application:
           
-📅 **Leave Details:**
-- **Start Date:** ${leaveData.startDate}
-- **End Date:** ${leaveData.endDate}
-- **Leave Type:** ${leaveData.leaveType}
-- **Reason:** ${leaveData.reason}
+📅 Details
+- Start Date: ${leaveData.startDate}
+- End Date: ${leaveData.endDate}
+- Leave Type: ${leaveData.leaveType}
+- Reason: ${leaveData.reason}
 
 I'll now process your leave application. Please wait a moment...`,
           shouldInvokeLeaveAgent: true,
@@ -180,6 +231,7 @@ I'll now process your leave application. Please wait a moment...`,
   // Main processing method
   async processMessage(userMessage, userEmail) {
     const userState = this.getOrCreateUserState(userEmail);
+    userState.userEmail = userEmail;
 
     // Classify intent
     const intent = await this.classifyIntent(userMessage, userEmail);

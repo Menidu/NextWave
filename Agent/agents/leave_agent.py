@@ -59,10 +59,15 @@ class LeaveAgent:
             ]
             
             if missing_fields:
+                user_friendly_list = ", ".join(missing_fields)
                 return {
                     **state,
                     "error": f"Missing required fields: {', '.join(missing_fields)}",
-                    "finalMessage": "I'm sorry, but some required information is missing from your leave application. Please try again.",
+                    "finalMessage": f"""⚠️ I need a few more details to submit your leave request.
+
+Please provide the following: {user_friendly_list}.
+
+Once you share these, I'll pick up right where we left off.""",
                     "status": "failed",
                 }
             
@@ -86,7 +91,7 @@ class LeaveAgent:
             return {
                 **state,
                 "error": str(error),
-                "finalMessage": "An error occurred while processing your leave application. Please try again.",
+                "finalMessage": "Sorry—something went wrong while creating your leave request. Please try again in a moment or contact HR if it continues.",
                 "status": "failed",
             }
     
@@ -108,7 +113,7 @@ class LeaveAgent:
             return {
                 **state,
                 "error": str(error),
-                "finalMessage": "An error occurred while checking for calendar conflicts.",
+                "finalMessage": "Sorry—I'm unable to check calendar conflicts right now. Please try again shortly.",
                 "status": "failed",
             }
     
@@ -123,15 +128,15 @@ class LeaveAgent:
                 return {
                     **state,
                     "approvalStatus": "requires_manual_review",
-                    "finalMessage": f"""⚠️ **Calendar Conflicts Detected**
+                    "finalMessage": f"""⚠️ Calendar conflicts found
 
-Your leave application has been submitted, but there are some calendar conflicts that need manual review:
+Your request is submitted, but we noticed a few potential conflicts that need a quick manual review:
 
 {chr(10).join(f'- {conflict}' for conflict in conflicts)}
 
-Your application ID is: `{application_id}`
+Reference ID: {application_id}
 
-A manager will review your request and get back to you within 24 hours.""",
+We'll route this to your manager and update you within 1 business day.""",
                     "status": "completed",
                 }
             
@@ -145,10 +150,11 @@ A manager will review your request and get back to you within 24 hours.""",
                 application["approvedAt"] = datetime.now().isoformat()
                 self.leave_applications[application_id] = application
             
+            enhanced_message = f"{approval_result['message']}\n\nReference ID: {application_id}"
             return {
                 **state,
                 "approvalStatus": approval_result["status"],
-                "finalMessage": approval_result["message"],
+                "finalMessage": enhanced_message,
                 "status": "completed",
             }
         except Exception as error:
@@ -156,7 +162,7 @@ A manager will review your request and get back to you within 24 hours.""",
             return {
                 **state,
                 "error": str(error),
-                "finalMessage": "An error occurred during the approval process.",
+                "finalMessage": "Sorry—something went wrong while running the approval step. Please try again.",
                 "status": "failed",
             }
     
@@ -191,64 +197,29 @@ A manager will review your request and get back to you within 24 hours.""",
         return conflicts
     
     async def simulate_approval_process(self, leave_data: Dict[str, Any]) -> Dict[str, str]:
-        """Simulate approval process"""
+        """Require manual supervisor approval for all leave types."""
         try:
             start_date = datetime.strptime(leave_data["startDate"], "%Y-%m-%d") if leave_data["startDate"].count("-") == 2 else datetime.now()
             end_date = datetime.strptime(leave_data["endDate"], "%Y-%m-%d") if leave_data["endDate"].count("-") == 2 else datetime.now()
             duration = max(1, (end_date - start_date).days + 1)
-            
-            # Auto-approve short casual leaves
-            if "casual" in leave_data.get("leaveType", "").lower() and duration <= 2:
-                return {
-                    "status": "approved",
-                    "message": f"""✅ **Leave Application Approved!**
-
-📅 **Leave Details:**
-- **Start Date:** {leave_data['startDate']}
-- **End Date:** {leave_data['endDate']}
-- **Leave Type:** {leave_data['leaveType']}
-- **Duration:** {duration} day(s)
-- **Reason:** {leave_data['reason']}
-
-Your leave has been automatically approved. Enjoy your time off!""",
-                }
-            
-            # Auto-approve sick leave
-            if "sick" in leave_data.get("leaveType", "").lower():
-                return {
-                    "status": "approved",
-                    "message": f"""✅ **Sick Leave Approved!**
-
-📅 **Leave Details:**
-- **Start Date:** {leave_data['startDate']}
-- **End Date:** {leave_data['endDate']}
-- **Leave Type:** {leave_data['leaveType']}
-- **Duration:** {duration} day(s)
-- **Reason:** {leave_data['reason']}
-
-Your sick leave has been approved. Take care and get well soon!""",
-                }
-            
-            # Require manual approval for other types
             return {
                 "status": "pending_approval",
-                "message": f"""⏳ **Leave Application Submitted**
+                "message": f"""⏳ Leave request submitted
 
-📅 **Leave Details:**
-- **Start Date:** {leave_data['startDate']}
-- **End Date:** {leave_data['endDate']}
-- **Leave Type:** {leave_data['leaveType']}
-- **Duration:** {duration} day(s)
-- **Reason:** {leave_data['reason']}
+📅 Details
+- Start: {leave_data['startDate']}
+- End: {leave_data['endDate']}
+- Type: {leave_data['leaveType']}
+- Duration: {duration} day(s)
+- Reason: {leave_data['reason']}
 
-Your leave application has been submitted and is pending supervisor approval. You'll receive a notification once it's reviewed.""",
+Your request is pending supervisor approval. You'll be notified once it's reviewed.""",
             }
-        
         except Exception as error:
             print(f"Error in simulate_approval_process: {error}")
             return {
                 "status": "error",
-                "message": "An error occurred during approval simulation.",
+                "message": "Sorry—something went wrong while simulating the approval.",
             }
     
     def build_workflow(self):
@@ -299,7 +270,7 @@ Your leave application has been submitted and is pending supervisor approval. Yo
             print(f"Error processing leave application: {error}")
             return {
                 "success": False,
-                "message": "An unexpected error occurred while processing your leave application. Please try again.",
+                "message": "Unexpected error while processing your leave request. Please try again shortly.",
                 "error": str(error),
             }
     

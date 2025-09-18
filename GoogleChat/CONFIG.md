@@ -17,6 +17,8 @@ PORT=3005
 
 ## Getting Your Gemini API Key
 
+new
+
 1. Go to [Google AI Studio](https://makersuite.google.com/app/apikey)
 2. Sign in with your Google account
 3. Click "Create API Key"

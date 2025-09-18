@@ -5,6 +5,11 @@ import cors from "cors";
 import fs from "fs";
 import axios from "axios";
 import { AgentManager } from "./agents/agentManager.js";
+import {
+  getUserProfile,
+  setSupervisorForUser,
+  setSupervisorSpace,
+} from "./agents/userDirectory.js";
 
 dotenv.config();
 
@@ -13,6 +18,8 @@ app.use(express.json());
 app.use(cors());
 
 const PORT = process.env.PORT || 3005;
+const SUPERVISOR_EMAIL =
+  process.env.SUPERVISOR_EMAIL || process.env.GOOGLE_CHAT_SUPERVISOR_EMAIL;
 const SERVICE_ACCOUNT_FILE =
   process.env.SERVICE_ACCOUNT_KEY_FILE || "./service-account-key.json";
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY; // <-- You set this in .env
@@ -69,7 +76,7 @@ async function getGeminiReply(userMessage) {
   }
 }
 
-// ====== Shared Utility (Unused here, kept for reference) ======
+// ====== Shared Utility ======
 async function sendMessageToUser(userEmail, messageText) {
   const authClient = await getAuthClient();
 
@@ -93,6 +100,65 @@ async function sendMessageToUser(userEmail, messageText) {
   });
 
   return { result: response.data, space: dmSpace.name };
+}
+
+// Send a cardsV2 interactive card to a user's DM (DM must already exist)
+async function sendCardToUser(userEmail, cardV2) {
+  const authClient = await getAuthClient();
+
+  const spaces = await chat.spaces.list({ auth: authClient, pageSize: 100 });
+  const dmSpace = (spaces.data.spaces || []).find(
+    (s) =>
+      s.spaceType === "DIRECT_MESSAGE" &&
+      s.singleUserBotDm?.user?.email === userEmail
+  );
+
+  if (!dmSpace) {
+    throw new Error(
+      `No DM space found with ${userEmail}. Ask them to message the bot first.`
+    );
+  }
+
+  const response = await chat.spaces.messages.create({
+    auth: authClient,
+    parent: dmSpace.name,
+    requestBody: { cardsV2: [cardV2] },
+  });
+
+  return { result: response.data, space: dmSpace.name };
+}
+
+async function getSupervisorEmailFor(userEmail) {
+  const profile = getUserProfile(userEmail);
+  return (
+    profile?.supervisorEmail ||
+    process.env.SUPERVISOR_EMAIL ||
+    process.env.GOOGLE_CHAT_SUPERVISOR_EMAIL ||
+    null
+  );
+}
+
+// Find supervisor DM space and cache it for the user; returns {spaceName}
+async function getOrCacheSupervisorDmSpace(userEmail) {
+  const supervisorEmail = await getSupervisorEmailFor(userEmail);
+  if (!supervisorEmail) return { spaceName: null, supervisorEmail: null };
+
+  const profile = getUserProfile(userEmail);
+  if (profile.supervisorSpaceName) {
+    return { spaceName: profile.supervisorSpaceName, supervisorEmail };
+  }
+
+  const authClient = await getAuthClient();
+  const spaces = await chat.spaces.list({ auth: authClient, pageSize: 100 });
+  const dmSpace = (spaces.data.spaces || []).find(
+    (s) =>
+      s.spaceType === "DIRECT_MESSAGE" &&
+      s.singleUserBotDm?.user?.email === supervisorEmail
+  );
+  if (!dmSpace) return { spaceName: null, supervisorEmail };
+
+  setSupervisorSpace(userEmail, dmSpace.name);
+  return { spaceName: dmSpace.name, supervisorEmail };
 }
 
 // ====== Routes ======
@@ -215,12 +281,94 @@ app.post("/chat/reset-user", async (req, res) => {
   }
 });
 
+// Set supervisor for a user
+app.post("/users/:email/supervisor", async (req, res) => {
+  const { email } = req.params;
+  const { supervisorEmail } = req.body || {};
+  if (!email || !supervisorEmail) {
+    return res
+      .status(400)
+      .json({ success: false, error: "email and supervisorEmail required" });
+  }
+  try {
+    setSupervisorForUser(email, supervisorEmail);
+    res.json({ success: true, email, supervisorEmail });
+  } catch (error) {
+    console.error("❌ Error setting supervisor:", error.message);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // Webhook handler
 app.post("/chat/webhook", async (req, res) => {
   const event = req.body;
 
   console.log("🔔 Incoming webhook event:", JSON.stringify(event, null, 2));
   res.status(200).json({}); // Always respond immediately
+
+  // Handle interactive card actions first (approval/denial)
+  try {
+    const action = event?.action || event?.common?.invokedFunction || null;
+    const actionMethodName =
+      action?.actionMethodName || event?.actionMethodName;
+    if (actionMethodName === "leave_approval") {
+      const paramsArray = action?.parameters || event?.parameters || [];
+      const params = Object.fromEntries(
+        paramsArray.map((p) => [p.key, p.value])
+      );
+
+      const applicationId = params.applicationId;
+      const decision = params.decision;
+      const approverEmail =
+        event?.chat?.messagePayload?.message?.sender?.email ||
+        event?.user?.email ||
+        null;
+
+      if (!applicationId || !decision) {
+        console.warn("⚠️ Missing applicationId/decision in action payload");
+        return;
+      }
+
+      const result = agentManager.leaveAgent.setApprovalStatus(
+        applicationId,
+        decision === "approved" ? "approved" : "denied",
+        approverEmail
+      );
+
+      if (!result.success) {
+        console.error("❌ Failed to update approval status:", result.error);
+        return;
+      }
+
+      const application = result.application;
+      const requesterEmail = application.requesterEmail;
+
+      if (requesterEmail) {
+        const requesterMsg =
+          decision === "approved"
+            ? `✅ Your leave request ${applicationId} was approved.\n\nDetails\n- Start: ${application.startDate}\n- End: ${application.endDate}\n- Type: ${application.leaveType}`
+            : `❌ Your leave request ${applicationId} was denied.`;
+        try {
+          await sendMessageToUser(requesterEmail, requesterMsg);
+        } catch (e) {
+          console.error("❌ Failed to notify requester:", e.message);
+        }
+      }
+
+      if (approverEmail) {
+        const approverMsg = `Recorded your decision (${decision}) for request ${applicationId}.`;
+        try {
+          await sendMessageToUser(approverEmail, approverMsg);
+        } catch (e) {
+          console.error("❌ Failed to notify approver:", e.message);
+        }
+      }
+
+      return; // Action handled; stop further processing
+    }
+  } catch (actionErr) {
+    console.error("❌ Error handling action in webhook:", actionErr.message);
+  }
 
   const spaceName = event?.chat?.messagePayload?.space?.name;
   const messageText = event?.chat?.messagePayload?.message?.text;
@@ -263,6 +411,92 @@ app.post("/chat/webhook", async (req, res) => {
           `📋 Leave application processed - ID: ${agentResult.applicationId}, Status: ${agentResult.status}`
         );
       }
+
+      // If pending approval, send approval card to requester's supervisor
+      if (agentResult.approvalStatus === "pending_approval") {
+        try {
+          const { spaceName, supervisorEmail } =
+            await getOrCacheSupervisorDmSpace(senderEmail);
+          const targetSupervisorEmail = supervisorEmail || SUPERVISOR_EMAIL;
+          if (!spaceName && !targetSupervisorEmail) {
+            console.warn(
+              "⚠️ No supervisor email or DM space configured for requester; cannot send approval card"
+            );
+            return;
+          }
+          const card = {
+            cardId: `leave-approval-${agentResult.applicationId}`,
+            card: {
+              header: {
+                title: "Leave approval request",
+                subtitle: `Application ${agentResult.applicationId}`,
+              },
+              sections: [
+                {
+                  widgets: [
+                    { textParagraph: { text: agentResult.message } },
+                    {
+                      buttonList: {
+                        buttons: [
+                          {
+                            text: "Approve",
+                            onClick: {
+                              action: {
+                                actionMethodName: "leave_approval",
+                                parameters: [
+                                  {
+                                    key: "applicationId",
+                                    value: agentResult.applicationId,
+                                  },
+                                  { key: "decision", value: "approved" },
+                                ],
+                              },
+                            },
+                          },
+                          {
+                            text: "Deny",
+                            onClick: {
+                              action: {
+                                actionMethodName: "leave_approval",
+                                parameters: [
+                                  {
+                                    key: "applicationId",
+                                    value: agentResult.applicationId,
+                                  },
+                                  { key: "decision", value: "denied" },
+                                ],
+                              },
+                            },
+                          },
+                        ],
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+          };
+
+          if (spaceName) {
+            const authClient = await getAuthClient();
+            await chat.spaces.messages.create({
+              auth: authClient,
+              parent: spaceName,
+              requestBody: { cardsV2: [card] },
+            });
+            console.log(
+              `📝 Sent approval card to cached supervisor DM ${spaceName} for ${agentResult.applicationId}`
+            );
+          } else {
+            await sendCardToUser(targetSupervisorEmail, card);
+            console.log(
+              `📝 Sent approval card to supervisor ${targetSupervisorEmail} for ${agentResult.applicationId}`
+            );
+          }
+        } catch (cardError) {
+          console.error("❌ Failed to send approval card:", cardError.message);
+        }
+      }
     } else {
       console.error("❌ Agent processing failed:", agentResult.error);
 
@@ -287,6 +521,70 @@ app.post("/chat/webhook", async (req, res) => {
     } catch (sendError) {
       console.error("❌ Failed to send error message:", sendError.message);
     }
+  }
+});
+
+// Handle Google Chat interactive card actions for approvals
+app.post("/chat/action", async (req, res) => {
+  const event = req.body;
+  res.status(200).json({});
+
+  try {
+    const action = event?.action || event?.common?.invokedFunction || null;
+    const actionMethodName =
+      action?.actionMethodName || event?.actionMethodName;
+    if (actionMethodName !== "leave_approval") return;
+
+    const paramsArray = action?.parameters || event?.parameters || [];
+    const params = Object.fromEntries(paramsArray.map((p) => [p.key, p.value]));
+    const applicationId = params.applicationId;
+    const decision = params.decision;
+    const approverEmail =
+      event?.chat?.messagePayload?.message?.sender?.email ||
+      event?.user?.email ||
+      null;
+
+    if (!applicationId || !decision) {
+      console.warn("⚠️ Missing applicationId/decision in action payload");
+      return;
+    }
+
+    const result = agentManager.leaveAgent.setApprovalStatus(
+      applicationId,
+      decision === "approved" ? "approved" : "denied",
+      approverEmail
+    );
+
+    if (!result.success) {
+      console.error("❌ Failed to update approval status:", result.error);
+      return;
+    }
+
+    const application = result.application;
+    const requesterEmail = application.requesterEmail;
+
+    if (requesterEmail) {
+      const requesterMsg =
+        decision === "approved"
+          ? `✅ Your leave request ${applicationId} was approved.\n\nDetails\n- Start: ${application.startDate}\n- End: ${application.endDate}\n- Type: ${application.leaveType}`
+          : `❌ Your leave request ${applicationId} was denied.`;
+      try {
+        await sendMessageToUser(requesterEmail, requesterMsg);
+      } catch (e) {
+        console.error("❌ Failed to notify requester:", e.message);
+      }
+    }
+
+    if (approverEmail) {
+      const approverMsg = `Recorded your decision (${decision}) for request ${applicationId}.`;
+      try {
+        await sendMessageToUser(approverEmail, approverMsg);
+      } catch (e) {
+        console.error("❌ Failed to notify approver:", e.message);
+      }
+    }
+  } catch (err) {
+    console.error("❌ Error handling card action:", err.message);
   }
 });
 
