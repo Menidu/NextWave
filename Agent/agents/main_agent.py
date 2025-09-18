@@ -60,9 +60,16 @@ class MainAgent:
                 "lastMessage": None,
                 "invalidAttempts": {},  # Track invalid format attempts per field
                 "lastFieldAsked": None,  # Track last field we asked about
+                "awaitingSupervisorEmail": False,
             }
             logger.info(f"Created new user state for {user_email}")
         return self.user_states[user_email]
+
+    def _extract_email(self, text: str) -> Optional[str]:
+        if not text:
+            return None
+        match = re.search(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", text, re.I)
+        return match.group(0) if match else None
 
     def clean_json_response(self, content: str) -> str:
         """Clean LLM response to extract pure JSON"""
@@ -152,20 +159,19 @@ class MainAgent:
 
     def _get_date_format_error_message(self) -> str:
         """Get a helpful error message with date format examples"""
-        return """❌ **Date format not recognized. Please use one of these formats:**
-
-📅 **Natural language:**
-• today, tomorrow
-• next Monday, this Friday  
-• in 3 days, in 2 weeks
-
-📅 **Specific dates:**
-• 2024-12-25 (recommended format)
-• December 25, 2024 or Dec 25, 2024
-• 25/12/2024 or 12/25/2024
-• December 25th, 2024
-
-**💡 Tip:** Use "YYYY-MM-DD" format for best results (e.g., 2024-12-25)"""
+        return (
+            "Date format not recognized. Please use one of these formats:\n\n"
+            "Natural language:\n"
+            "- today, tomorrow\n"
+            "- next Monday, this Friday\n"
+            "- in 3 days, in 2 weeks\n\n"
+            "Specific dates:\n"
+            "- 2024-12-25 (recommended format)\n"
+            "- December 25, 2024 or Dec 25, 2024\n"
+            "- 25/12/2024 or 12/25/2024\n"
+            "- December 25th, 2024\n\n"
+            "Tip: Use YYYY-MM-DD format for best results (for example, 2024-12-25)."
+        )
 
     def validate_leave_dates(self, start_date: str, end_date: str) -> Tuple[bool, Optional[str]]:
         """Validate that end date is after start date"""
@@ -404,9 +410,26 @@ Examples:
         """Generate conversational response with enhanced validation"""
         leave_data = user_state["leaveData"]
         is_collecting_leave_data = user_state["isCollectingLeaveData"]
+        awaiting_supervisor = user_state.get("awaitingSupervisorEmail", False)
         invalid_attempts = user_state.get("invalidAttempts", {})
         
         if is_collecting_leave_data:
+            # If awaiting supervisor email, handle that first
+            if awaiting_supervisor:
+                supervisor_email = self._extract_email(user_message)
+                if not supervisor_email:
+                    return {
+                        "response": "Please provide your supervisor's email address (for example, name@company.com).",
+                        "shouldInvokeLeaveAgent": False,
+                        "leaveData": leave_data.copy(),
+                    }
+                leave_data["supervisorEmail"] = supervisor_email
+                user_state["awaitingSupervisorEmail"] = False
+                return {
+                    "response": "Thanks, I saved your supervisor details. Continuing your leave submission...",
+                    "shouldInvokeLeaveAgent": True,
+                    "leaveData": leave_data.copy(),
+                }
             # Extract new information using hybrid approach
             extracted_data = await self.extract_leave_info(user_message, leave_data)
             
@@ -418,7 +441,7 @@ Examples:
                 if field in ["startDate", "endDate"] and value:
                     parsed_date, error = self.parse_date_flexible(value)
                     if error:
-                        validation_errors.append(f"**{field.replace('Date', ' Date')}:** {error}")
+                        validation_errors.append(f"{field.replace('Date', ' date')}: {error}")
                         # Track invalid attempts
                         invalid_attempts[field] = invalid_attempts.get(field, 0) + 1
                     else:
@@ -447,13 +470,25 @@ Examples:
                 )
                 if not valid_range:
                     return {
-                        "response": f"❌ **Date Range Issue:**\n\n{range_error}\n\nPlease provide valid start and end dates.",
+                        "response": f"Date range issue: {range_error} Please provide valid start and end dates.",
                         "shouldInvokeLeaveAgent": False,
                         "leaveData": leave_data.copy(),
                     }
             
             # Check if all data is complete
             if self.is_leave_data_complete(leave_data):
+                # Ensure supervisor email is present before submission
+                if not leave_data.get("supervisorEmail"):
+                    inline_email = self._extract_email(user_message)
+                    if inline_email:
+                        leave_data["supervisorEmail"] = inline_email
+                    else:
+                        user_state["awaitingSupervisorEmail"] = True
+                        return {
+                            "response": "Before I submit, what is your supervisor's email?",
+                            "shouldInvokeLeaveAgent": False,
+                            "leaveData": leave_data.copy(),
+                        }
                 user_state["isCollectingLeaveData"] = False
                 user_state["invalidAttempts"] = {}  # Reset invalid attempts
                 
@@ -466,15 +501,15 @@ Examples:
                     end_display = leave_data['endDate']
                 
                 return {
-                    "response": f"""✅ **Perfect! I have all the information needed for your leave application:**
-                    
-📅 **Leave Details:**
-• **Start Date:** {start_display}
-• **End Date:** {end_display}
-• **Leave Type:** {leave_data['leaveType'].title()}
-• **Reason:** {leave_data['reason']}
-
-🔄 **Processing your leave application now...**""",
+                    "response": (
+                        "I have all the information needed for your leave application.\n\n"
+                        "Leave details:\n"
+                        f"- Start date: {start_display}\n"
+                        f"- End date: {end_display}\n"
+                        f"- Leave type: {leave_data['leaveType'].title()}\n"
+                        f"- Reason: {leave_data['reason']}\n\n"
+                        "Processing your leave application now..."
+                    ),
                     "shouldInvokeLeaveAgent": True,
                     "leaveData": leave_data.copy(),
                 }
@@ -486,31 +521,31 @@ Examples:
                 ]
                 
                 field_prompts = {
-                    "startDate": """📅 **When would you like your leave to start?**
-                    
-You can say:
-• Specific dates: "2024-12-23" or "December 23, 2024"
-• Relative dates: "tomorrow", "next Monday", "in 3 days"
-• Ranges: "from December 23 to December 27" """,
-                    
-                    "endDate": """📅 **When should your leave end?**
-                    
-You can say:
-• Specific dates: "2024-12-27" or "December 27, 2024"  
-• Relative dates: "next Friday", "in 5 days"
-• Or mention both dates together: "from start date to end date" """,
-                    
-                    "leaveType": """📋 **What type of leave is this?**
-                    
-Common types:
-• Casual leave
-• Sick leave
-• Vacation / Annual leave
-• Personal leave
-• Emergency leave
-• Maternity/Paternity leave""",
-                    
-                    "reason": "📝 **What's the reason for your leave?** (A brief description is fine)"
+                    "startDate": (
+                        "When would you like your leave to start?\n\n"
+                        "You can say:\n"
+                        "- Specific dates: 2024-12-23 or December 23, 2024\n"
+                        "- Relative dates: tomorrow, next Monday, in 3 days\n"
+                        "- Ranges: from December 23 to December 27"
+                    ),
+                    "endDate": (
+                        "When should your leave end?\n\n"
+                        "You can say:\n"
+                        "- Specific dates: 2024-12-27 or December 27, 2024\n"
+                        "- Relative dates: next Friday, in 5 days\n"
+                        "- Or mention both dates together: from start date to end date"
+                    ),
+                    "leaveType": (
+                        "What type of leave is this?\n\n"
+                        "Common types:\n"
+                        "- Casual leave\n"
+                        "- Sick leave\n"
+                        "- Vacation / Annual leave\n"
+                        "- Personal leave\n"
+                        "- Emergency leave\n"
+                        "- Maternity or Paternity leave"
+                    ),
+                    "reason": "What is the reason for your leave? A brief description is fine.",
                 }
                 
                 next_field = missing_fields[0]
@@ -519,11 +554,11 @@ Common types:
                 # Add encouragement if we got some data
                 if validated_data:
                     updated_fields = [f.replace('Date', ' date') for f in validated_data.keys()]
-                    prompt = f"✅ Great! I got your {', '.join(updated_fields)}.\n\n{prompt}"
+                    prompt = f"I recorded your {', '.join(updated_fields)}.\n\n{prompt}"
                 
                 # Add additional help if user has failed multiple times
                 if invalid_attempts.get(next_field, 0) >= 2:
-                    prompt += "\n\n💡 **Having trouble?** You can also say 'help with dates' for more examples."
+                    prompt += "\n\nIf you want more examples, say 'help with dates'."
                 
                 user_state["lastFieldAsked"] = next_field
                 return {
@@ -560,7 +595,7 @@ Common types:
             except Exception as error:
                 logger.error(f"Error generating response: {error}")
                 return {
-                    "response": "I'm here to help! How can I assist you today?",
+                    "response": "I'm here to help. How can I assist you today?",
                     "shouldInvokeLeaveAgent": False,
                     "leaveData": None,
                 }
@@ -620,7 +655,7 @@ Common types:
                 if validation_errors:
                     error_msg = "\n".join(validation_errors)
                     return {
-                        "response": f"👋 I'd be happy to help with your leave application!\n\n{error_msg}",
+                    "response": f"I can help with your leave application. {error_msg}",
                         "shouldInvokeLeaveAgent": False,
                         "leaveData": user_state["leaveData"].copy(),
                     }
@@ -641,17 +676,17 @@ Common types:
                             )
                             if not valid_range:
                                 return {
-                                    "response": f"❌ **Date Range Issue:**\n\n{range_error}",
+                                "response": f"Date range issue: {range_error}",
                                     "shouldInvokeLeaveAgent": False,
                                     "leaveData": user_state["leaveData"].copy(),
                                 }
                     
                     if missing_fields:
                         field_prompts = {
-                            "startDate": "📅 When would you like your leave to start?",
-                            "endDate": "📅 When should your leave end?",
-                            "leaveType": "📋 What type of leave is this? (casual, sick, vacation, etc.)",
-                            "reason": "📝 What's the reason for your leave?",
+                            "startDate": "When would you like your leave to start?",
+                            "endDate": "When should your leave end?",
+                            "leaveType": "What type of leave is this? (casual, sick, vacation, etc.)",
+                            "reason": "What is the reason for your leave?",
                         }
                         
                         next_field = missing_fields[0]
@@ -663,15 +698,14 @@ Common types:
                         }
                 else:
                     return {
-                        "response": """👋 **I'd be happy to help you apply for leave!**
-                        
-📅 To get started, please tell me:
-• When you'd like to start your leave
-• When it should end
-• What type of leave it is
-• The reason for your leave
-
-**Example:** "I want to take vacation from December 23 to December 27 for family time" """,
+                        "response": (
+                            "I can help you apply for leave. To get started, please tell me:\n"
+                            "- When you'd like to start your leave\n"
+                            "- When it should end\n"
+                            "- What type of leave it is\n"
+                            "- The reason for your leave\n\n"
+                            "Example: I want to take vacation from December 23 to December 27 for family time"
+                        ),
                         "shouldInvokeLeaveAgent": False,
                         "leaveData": {},
                     }

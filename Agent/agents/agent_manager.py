@@ -25,6 +25,11 @@ class AgentManager:
                 extracted_data = main_agent_result["leaveData"]
                 print("Extracted leave data:", extracted_data)
                 
+                # Ensure requester and supervisor context are included
+                requester_email = user_email
+                if extracted_data and isinstance(extracted_data, dict):
+                    extracted_data.setdefault("requesterEmail", requester_email)
+
                 # Process with Leave Agent
                 leave_agent_result = await self.leave_agent.process_leave_application(
                     extracted_data

@@ -63,11 +63,11 @@ class LeaveAgent:
                 return {
                     **state,
                     "error": f"Missing required fields: {', '.join(missing_fields)}",
-                    "finalMessage": f"""⚠️ I need a few more details to submit your leave request.
-
-Please provide the following: {user_friendly_list}.
-
-Once you share these, I'll pick up right where we left off.""",
+                    "finalMessage": (
+                        f"I need a few more details to submit your leave request. "
+                        f"Please provide the following: {user_friendly_list}. "
+                        "Once you share these, I'll continue the submission."
+                    ),
                     "status": "failed",
                 }
             
@@ -77,6 +77,8 @@ Once you share these, I'll pick up right where we left off.""",
                 **leave_data,
                 "submittedAt": datetime.now().isoformat(),
                 "status": "pending",
+                "requesterEmail": leave_data.get("requesterEmail"),
+                "supervisorEmail": leave_data.get("supervisorEmail"),
             }
             
             self.leave_applications[application_id] = application
@@ -113,7 +115,7 @@ Once you share these, I'll pick up right where we left off.""",
             return {
                 **state,
                 "error": str(error),
-                "finalMessage": "Sorry—I'm unable to check calendar conflicts right now. Please try again shortly.",
+                "finalMessage": "I'm unable to check calendar conflicts right now. Please try again shortly.",
                 "status": "failed",
             }
     
@@ -128,15 +130,13 @@ Once you share these, I'll pick up right where we left off.""",
                 return {
                     **state,
                     "approvalStatus": "requires_manual_review",
-                    "finalMessage": f"""⚠️ Calendar conflicts found
-
-Your request is submitted, but we noticed a few potential conflicts that need a quick manual review:
-
-{chr(10).join(f'- {conflict}' for conflict in conflicts)}
-
-Reference ID: {application_id}
-
-We'll route this to your manager and update you within 1 business day.""",
+                    "finalMessage": (
+                        "Calendar conflicts found. "
+                        "Your request is submitted, but we noticed a few potential conflicts that need a quick manual review:\n\n"
+                        + chr(10).join(f"- {conflict}" for conflict in conflicts)
+                        + f"\n\nReference ID: {application_id}\n\n"
+                        "We'll route this to your supervisor and update you within 1 business day."
+                    ),
                     "status": "completed",
                 }
             
@@ -219,7 +219,7 @@ Your request is pending supervisor approval. You'll be notified once it's review
             print(f"Error in simulate_approval_process: {error}")
             return {
                 "status": "error",
-                "message": "Sorry—something went wrong while simulating the approval.",
+                "message": "Something went wrong while simulating the approval.",
             }
     
     def build_workflow(self):
