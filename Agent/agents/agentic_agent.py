@@ -50,17 +50,19 @@ class AgenticAgent:
             "route": lambda x, y: y if y is not None else x,
             "finalMessage": lambda x, y: y if y is not None else x,
             "error": lambda x, y: y if y is not None else x,
+            "missingFields": lambda x, y: y if y is not None else x,
+            "validationError": lambda x, y: y if y is not None else x,
         }
 
     async def _decide_next(self, state: AgenticState) -> AgenticState:
         try:
             system = (
-                "You are an autonomous flow controller. Decide the next step from the user's latest message and partial leave data.\n\n"
-                "Choose one route strictly:\n"
-                "- collect_leave: user intent about leave; we need to extract or update fields.\n"
-                "- run_leave_workflow: all REQUIRED fields present (startDate, endDate, leaveType, reason, supervisorEmail).\n"
-                "- general_chat: otherwise.\n\n"
-                "Return only JSON: {\"route\": \"collect_leave|run_leave_workflow|general_chat\"}"
+                "You orchestrate a friendly workplace assistant. Decide the next step from the latest user message and partial leave data.\n\n"
+                "ROUTE RULES (pick exactly one):\n"
+                "- collect_leave: user is talking about time off/leave OR providing details; we should extract/update fields.\n"
+                "- run_leave_workflow: ALL REQUIRED fields present (startDate, endDate, leaveType, reason, supervisorEmail).\n"
+                "- general_chat: everything else (answer helpfully).\n\n"
+                "Respond ONLY with JSON: {\"route\": \"collect_leave|run_leave_workflow|general_chat\"}"
             )
             messages = [
                 SystemMessage(content=system),
@@ -85,9 +87,9 @@ class AgenticAgent:
     async def _collect_leave_fields(self, state: AgenticState) -> AgenticState:
         try:
             system = (
-                "Extract or update leave fields from the user's latest message.\n"
-                "Fields: startDate, endDate, leaveType, reason, supervisorEmail.\n"
-                "Return ONLY JSON with any fields found. Do not include explanations."
+                "You extract leave details from a friendly workplace chat.\n"
+                "Fields to capture: startDate, endDate, leaveType, reason, supervisorEmail.\n"
+                "Return ONLY compact JSON with fields found (no prose)."
             )
             current = state.get("leaveData", {})
             messages = [
@@ -106,21 +108,26 @@ class AgenticAgent:
             updated = {**current, **{k: v for k, v in updates.items() if v}}
             return {**state, "leaveData": updated}
         except Exception as error:
-            return {**state, "error": str(error), "finalMessage": "Sorry—couldn’t parse your leave details."}
+            # Ask LLM to inform the user about parsing trouble
+            msg = await self._llm_safe_message("We had trouble parsing leave details from the last message. Ask for one specific missing detail.")
+            return {**state, "error": str(error), "finalMessage": msg}
 
     async def _validate_leave(self, state: AgenticState) -> AgenticState:
         try:
             leave = state.get("leaveData", {})
             normalized, err = normalize_leave_dates(leave)
             if err:
-                return {**state, "leaveData": normalized, "finalMessage": err}
+                # Route to crafted prompt with validation context
+                return {**state, "leaveData": normalized, "validationError": err}
             required = ["startDate", "endDate", "leaveType", "reason", "supervisorEmail"]
             missing = [f for f in required if not normalized.get(f)]
             if missing:
-                return {**state, "leaveData": normalized, "finalMessage": ", ".join(missing)}
+                # Route to crafted prompt with missing fields context
+                return {**state, "leaveData": normalized, "missingFields": missing}
             return {**state, "leaveData": normalized, "route": "run_leave_workflow"}
         except Exception as error:
-            return {**state, "error": str(error), "finalMessage": "Validation failed. Please check your inputs."}
+            msg = await self._llm_safe_message("Validation failed for leave inputs. Ask for the most critical missing/corrected field politely.")
+            return {**state, "error": str(error), "finalMessage": msg}
 
     async def _craft_prompt(self, state: AgenticState) -> AgenticState:
         try:
@@ -128,26 +135,28 @@ class AgenticAgent:
             required = ["startDate", "endDate", "leaveType", "reason", "supervisorEmail"]
             missing = [f for f in required if not leave.get(f)]
             system = (
-                "You are a helpful assistant. Ask ONE concise question to collect the next most critical missing field. "
-                "Use examples if the field is a date. Keep under 25 words."
+                "You are a friendly workplace assistant. Ask ONE concise, polite question to collect the next most important missing field (startDate, endDate, or leaveType first). "
+                "If asking for a date, give a quick example (e.g., 2025-01-15 or 'next Monday'). Keep under 25 words."
             )
             messages = [
                 SystemMessage(content=system),
                 HumanMessage(content=json.dumps({
                     "latest": state.get("lastUserMessage", ""),
-                    "missing": missing,
+                    "missing": state.get("missingFields") or missing,
+                    "validationError": state.get("validationError"),
                     "have": {k: v for k, v in leave.items() if v},
                 })),
             ]
             resp = await self.llm.ainvoke(messages)
             return {**state, "finalMessage": resp.content}
         except Exception as error:
-            return {**state, "error": str(error), "finalMessage": "Please share the next missing detail."}
+            msg = await self._llm_safe_message("Ask for the next missing leave detail in under 25 words.")
+            return {**state, "error": str(error), "finalMessage": msg}
 
     async def _general_chat(self, state: AgenticState) -> AgenticState:
         try:
             system = (
-                "You are a concise and helpful workplace assistant. Answer briefly and helpfully."
+                "You are a friendly workplace assistant. Be professional, supportive, and concise. Offer actionable help and short examples when useful."
             )
             messages = [
                 SystemMessage(content=system),
@@ -156,7 +165,8 @@ class AgenticAgent:
             resp = await self.llm.ainvoke(messages)
             return {**state, "finalMessage": resp.content}
         except Exception as error:
-            return {**state, "error": str(error), "finalMessage": "I'm having trouble responding right now."}
+            msg = await self._llm_safe_message("Provide a brief, friendly apology and ask how to help further.")
+            return {**state, "error": str(error), "finalMessage": msg}
 
     def _build_graph(self):
         workflow = StateGraph(AgenticState)
@@ -237,5 +247,18 @@ class AgenticAgent:
         # Generate a new logical thread id for this user for subsequent interactions
         import uuid
         self.user_thread_ids[user_email] = f"{user_email}::{uuid.uuid4()}"
+
+    async def _llm_safe_message(self, instruction: str) -> str:
+        try:
+            system = "You are a helpful assistant. Follow the instruction to produce a single short user-facing message."
+            messages = [
+                SystemMessage(content=system),
+                HumanMessage(content=instruction),
+            ]
+            resp = await self.llm.ainvoke(messages)
+            return resp.content or ""
+        except Exception:
+            # Last resort minimal message
+            return "Sorry, something went wrong. Could you rephrase or provide the next detail?"
 
 
