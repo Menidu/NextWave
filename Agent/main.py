@@ -142,7 +142,7 @@ async def startup_event():
     agent_manager = AgentManager()
     print("🚀 Multi-Agent Workplace Bot started successfully")
     print("🤖 Agents initialized:")
-    print("   - Main Agent (Conversational Router)")
+    print("   - Agentic Router (LangGraph + persistent memory)")
     print("   - Leave Agent (LangGraph Workflow)")
 
 # Health check
