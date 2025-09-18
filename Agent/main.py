@@ -57,6 +57,8 @@ class ResetUserRequest(BaseModel):
 
 class WebhookEvent(BaseModel):
     chat: Optional[Dict[str, Any]] = None
+    applicationId: Optional[str] = None
+    decision: Optional[str] = None
 
 # Initialize Google Auth and Chat service
 def initialize_google_services():
@@ -262,6 +264,25 @@ async def webhook_handler(request: Request):
             print("🤖 Skipping bot message")
             return response
         
+        # Supervisor approval webhook via query/body
+        application_id = event.get("applicationId")
+        decision = event.get("decision")
+        if application_id and decision and agent_manager:
+            try:
+                updated = agent_manager.leave_agent.update_approval_status(application_id, decision)
+                if updated:
+                    # Notify requester via Chat if available
+                    requester = updated.get("requesterEmail")
+                    message_text = f"Your leave request ({application_id}) was {updated.get('approvalStatus')} by your supervisor."
+                    if requester:
+                        try:
+                            await send_message_to_user(requester, message_text)
+                        except Exception as _:
+                            pass
+                    print(f"✅ Approval updated: {application_id} -> {updated.get('approvalStatus')}")
+            except Exception as err:
+                print(f"❌ Failed to update approval: {err}")
+
         # Process in background (simulate async processing)
         import asyncio
         asyncio.create_task(process_webhook_message(space_name, message_text, sender_email))

@@ -171,7 +171,7 @@ class LeaveAgent:
                 return {**state, "approvalStatus": "requires_manual_review", "finalMessage": message, "status": "completed"}
             
             # Send supervisor poll card (tool), if supervisor email present
-            poll_status = await self.try_send_supervisor_poll(leave_data)
+            poll_status = await self.try_send_supervisor_poll(leave_data, application_id)
 
             # LLM-crafted approval message (status kept as pending_approval)
             try:
@@ -316,8 +316,10 @@ Your request is pending supervisor approval. You'll be notified once it's review
             print(f"Calendar tool unavailable or failed: {error}")
             return []
 
-    async def try_send_supervisor_poll(self, leave_data: Dict[str, Any]) -> str:
-        """Optional tool: Send a Google Chat card with Approve/Deny buttons to supervisor DM."""
+    async def try_send_supervisor_poll(self, leave_data: Dict[str, Any], application_id: Optional[str]) -> str:
+        """Optional tool: Send a Google Chat card with Approve/Deny buttons to supervisor DM.
+        Buttons link to APPROVAL_WEBHOOK_URL with applicationId and decision query params.
+        """
         try:
             from google.oauth2 import service_account
             from googleapiclient.discovery import build
@@ -346,7 +348,12 @@ Your request is pending supervisor approval. You'll be notified once it's review
             reason = leave_data.get('reason')
             requester = leave_data.get('requesterEmail')
 
-            # Simple card; actual Approve/Deny handling requires interactive endpoints
+            # Build approval URLs from env
+            base_url = os.getenv("APPROVAL_WEBHOOK_URL") or ""
+            approve_url = f"{base_url}?applicationId={application_id}&decision=approve" if base_url and application_id else "https://example.com/approve"
+            deny_url = f"{base_url}?applicationId={application_id}&decision=deny" if base_url and application_id else "https://example.com/deny"
+
+            # Simple card; interactive clicks go to our webhook URL
             card = {
                 "cardsV2": [
                     {
@@ -363,8 +370,8 @@ Your request is pending supervisor approval. You'll be notified once it's review
                                     "header": "Actions",
                                     "widgets": [
                                         {"buttonList": {"buttons": [
-                                            {"text": "Approve", "onClick": {"openLink": {"url": "https://example.com/approve"}}},
-                                            {"text": "Deny", "onClick": {"openLink": {"url": "https://example.com/deny"}}},
+                                            {"text": "Approve", "onClick": {"openLink": {"url": approve_url}}},
+                                            {"text": "Deny", "onClick": {"openLink": {"url": deny_url}}},
                                         ]}}
                                     ]
                                 }
@@ -379,6 +386,18 @@ Your request is pending supervisor approval. You'll be notified once it's review
         except Exception as error:
             print(f"Supervisor poll send failed: {error}")
             return "failed"
+
+    def update_approval_status(self, application_id: str, decision: str) -> Optional[Dict[str, Any]]:
+        """Update application approval status based on supervisor decision."""
+        app = self.leave_applications.get(application_id)
+        if not app:
+            return None
+        status = "approved" if decision.lower() == "approve" else "denied"
+        app["approvalStatus"] = status
+        app["status"] = "completed"
+        app["decisionAt"] = datetime.now().isoformat()
+        self.leave_applications[application_id] = app
+        return app
     
     async def process_leave_application(self, leave_data: Dict[str, Any]) -> Dict[str, Any]:
         """Main method to process leave application"""
