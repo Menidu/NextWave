@@ -5,7 +5,12 @@ from typing import Any, Dict, Optional, TypedDict
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+try:
+    from langgraph.checkpoint.sqlite import SqliteSaver  # Available in newer langgraph versions
+except Exception:
+    SqliteSaver = None  # Fallback to in-memory saver below
+from langgraph.checkpoint.memory import MemorySaver
+from .utils import clean_json_response, normalize_leave_dates
 
 
 class AgenticState(TypedDict, total=False):
@@ -25,8 +30,12 @@ class AgenticAgent:
             temperature=0.2,
         )
 
-        memory_path = os.getenv("LANGGRAPH_SQLITE_PATH", os.path.join(os.path.dirname(__file__), "..", "agent_memory.sqlite3"))
-        self.checkpointer = SqliteSaver.from_conn_string(os.path.abspath(memory_path))
+        # Prefer SQLite persistence when available; otherwise fall back to in-memory saver
+        if SqliteSaver is not None:
+            memory_path = os.getenv("LANGGRAPH_SQLITE_PATH", os.path.join(os.path.dirname(__file__), "..", "agent_memory.sqlite3"))
+            self.checkpointer = SqliteSaver.from_conn_string(os.path.abspath(memory_path))
+        else:
+            self.checkpointer = MemorySaver()
 
         # Runtime mapping to rotate thread IDs per user when resetting memory
         self.user_thread_ids: Dict[str, str] = {}
@@ -46,13 +55,12 @@ class AgenticAgent:
     async def _decide_next(self, state: AgenticState) -> AgenticState:
         try:
             system = (
-                "You are a routing controller for a workplace assistant. "
-                "Decide the next step based on the user's latest message and any partial leave data.\n\n"
-                "ROUTES:\n"
-                "- collect_leave: if the user is providing or asking about leave request details.\n"
-                "- run_leave_workflow: if all required leave fields are present (startDate, endDate, leaveType, reason, supervisorEmail).\n"
-                "- general_chat: for everything else.\n\n"
-                "Return ONLY a compact JSON: {\"route\": one_of(collect_leave, run_leave_workflow, general_chat)}."
+                "You are an autonomous flow controller. Decide the next step from the user's latest message and partial leave data.\n\n"
+                "Choose one route strictly:\n"
+                "- collect_leave: user intent about leave; we need to extract or update fields.\n"
+                "- run_leave_workflow: all REQUIRED fields present (startDate, endDate, leaveType, reason, supervisorEmail).\n"
+                "- general_chat: otherwise.\n\n"
+                "Return only JSON: {\"route\": \"collect_leave|run_leave_workflow|general_chat\"}"
             )
             messages = [
                 SystemMessage(content=system),
@@ -62,7 +70,7 @@ class AgenticAgent:
                 })),
             ]
             resp = await self.llm.ainvoke(messages)
-            content = resp.content.strip()
+            content = clean_json_response(resp.content)
             try:
                 data = json.loads(content)
                 route = data.get("route")
@@ -87,15 +95,7 @@ class AgenticAgent:
                 HumanMessage(content=f"message: {state.get('lastUserMessage','')}\ncurrent: {json.dumps(current)}"),
             ]
             resp = await self.llm.ainvoke(messages)
-            content = resp.content.strip()
-            # best-effort JSON cleanup
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            content = content.strip()
+            content = clean_json_response(resp.content)
             try:
                 updates = json.loads(content)
                 if not isinstance(updates, dict):
@@ -104,16 +104,45 @@ class AgenticAgent:
                 updates = {}
 
             updated = {**current, **{k: v for k, v in updates.items() if v}}
-            missing = [f for f in ["startDate", "endDate", "leaveType", "reason", "supervisorEmail"] if not updated.get(f)]
-            if missing:
-                prompt = (
-                    "I recorded your details. Please provide the following to proceed: "
-                    + ", ".join(missing)
-                )
-                return {**state, "leaveData": updated, "finalMessage": prompt}
-            return {**state, "leaveData": updated, "route": "run_leave_workflow"}
+            return {**state, "leaveData": updated}
         except Exception as error:
             return {**state, "error": str(error), "finalMessage": "Sorry—couldn’t parse your leave details."}
+
+    async def _validate_leave(self, state: AgenticState) -> AgenticState:
+        try:
+            leave = state.get("leaveData", {})
+            normalized, err = normalize_leave_dates(leave)
+            if err:
+                return {**state, "leaveData": normalized, "finalMessage": err}
+            required = ["startDate", "endDate", "leaveType", "reason", "supervisorEmail"]
+            missing = [f for f in required if not normalized.get(f)]
+            if missing:
+                return {**state, "leaveData": normalized, "finalMessage": ", ".join(missing)}
+            return {**state, "leaveData": normalized, "route": "run_leave_workflow"}
+        except Exception as error:
+            return {**state, "error": str(error), "finalMessage": "Validation failed. Please check your inputs."}
+
+    async def _craft_prompt(self, state: AgenticState) -> AgenticState:
+        try:
+            leave = state.get("leaveData", {})
+            required = ["startDate", "endDate", "leaveType", "reason", "supervisorEmail"]
+            missing = [f for f in required if not leave.get(f)]
+            system = (
+                "You are a helpful assistant. Ask ONE concise question to collect the next most critical missing field. "
+                "Use examples if the field is a date. Keep under 25 words."
+            )
+            messages = [
+                SystemMessage(content=system),
+                HumanMessage(content=json.dumps({
+                    "latest": state.get("lastUserMessage", ""),
+                    "missing": missing,
+                    "have": {k: v for k, v in leave.items() if v},
+                })),
+            ]
+            resp = await self.llm.ainvoke(messages)
+            return {**state, "finalMessage": resp.content}
+        except Exception as error:
+            return {**state, "error": str(error), "finalMessage": "Please share the next missing detail."}
 
     async def _general_chat(self, state: AgenticState) -> AgenticState:
         try:
@@ -133,6 +162,8 @@ class AgenticAgent:
         workflow = StateGraph(AgenticState)
         workflow.add_node("decide_next", self._decide_next)
         workflow.add_node("collect_leave", self._collect_leave_fields)
+        workflow.add_node("validate_leave", self._validate_leave)
+        workflow.add_node("craft_prompt", self._craft_prompt)
         workflow.add_node("general_chat", self._general_chat)
 
         # Entry and routing
@@ -152,12 +183,28 @@ class AgenticAgent:
             {
                 "collect_leave": "collect_leave",
                 "general_chat": "general_chat",
-                "run_leave_workflow": "run_leave_workflow",
+                "run_leave_workflow": END,
+            },
+        )
+
+        # After collecting, validate; after validation, either workflow or craft a question
+        workflow.add_edge("collect_leave", "validate_leave")
+        def post_validate(state: AgenticState) -> str:
+            if state.get("route") == "run_leave_workflow":
+                return "run_leave_workflow"
+            # If we have a finalMessage with missing guidance, ask crafted prompt
+            return "craft_prompt"
+        workflow.add_conditional_edges(
+            "validate_leave",
+            post_validate,
+            {
+                "run_leave_workflow": END,
+                "craft_prompt": "craft_prompt",
             },
         )
 
         # collect_leave can either finish or go run workflow next time
-        workflow.add_edge("collect_leave", END)
+        workflow.add_edge("craft_prompt", END)
         workflow.add_edge("general_chat", END)
 
         # run_leave_workflow is provided by external manager; we end here and let caller invoke downstream
