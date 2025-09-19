@@ -55,8 +55,14 @@ class LeaveAgent:
 
     async def _llm_text(self, system: str, payload: dict) -> str:
         try:
+            from datetime import datetime, timezone
+            today_iso = datetime.now(timezone.utc).date().isoformat()
+            system_with_date = (
+                f"{system}\n\n"
+                f"Context: Today's date is {today_iso}. Interpret any relative dates (e.g., 'next Monday') relative to today."
+            )
             messages = [
-                SystemMessage(content=system),
+                SystemMessage(content=system_with_date),
                 HumanMessage(content=json.dumps(payload)),
             ]
             resp = await self.llm.ainvoke(messages)

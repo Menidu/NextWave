@@ -1,5 +1,6 @@
 import os
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, TypedDict
 # Using Google Gemini via LangChain
 
@@ -97,8 +98,10 @@ class AgenticAgent:
 
     async def _collect_leave_fields(self, state: AgenticState) -> AgenticState:
         try:
+            today_iso = datetime.now(timezone.utc).date().isoformat()
             system = (
-                "You extract leave details from a friendly workplace chat.\n"
+                f"You extract leave details from a friendly workplace chat.\n"
+                f"Today is {today_iso}. Interpret relative dates (e.g., 'next Monday') relative to today.\n"
                 "Fields to capture: startDate, endDate, leaveType, reason, supervisorEmail.\n"
                 "For supervisorEmail: extract any email address mentioned, even if not explicitly labeled.\n"
                 "Return ONLY compact JSON with fields found (no prose)."
@@ -165,8 +168,10 @@ class AgenticAgent:
             if "supervisorEmail" in missing:
                 return {**state, "finalMessage": "I need your supervisor's email address to send the approval request. Please provide it (e.g., john@company.com)."}
             
+            today_iso = datetime.now(timezone.utc).date().isoformat()
             system = (
-                "You are a friendly workplace assistant. Ask ONE concise, polite question to collect the next most important missing field. "
+                f"You are a friendly workplace assistant. Today is {today_iso}. "
+                "Ask ONE concise, polite question to collect the next most important missing field. "
                 "Priority order: startDate, endDate, leaveType, reason. "
                 "If asking for a date, give a quick example (e.g., 2025-01-15 or 'next Monday'). Keep under 25 words."
             )
@@ -198,9 +203,12 @@ class AgenticAgent:
             
             greeting = f"Hello {first_name}! I'm Mira, your workplace assistant. " if is_first else ""
             
+            today_iso = datetime.now(timezone.utc).date().isoformat()
             system = f"""You are Mira, a friendly and helpful workplace assistant. You have access to company policies and can help with various workplace questions.
 
 {greeting}Be professional, supportive, and concise. Offer actionable help and short examples when useful.
+
+Today's date: {today_iso}. When the user mentions relative dates (e.g., "next Monday"), interpret them relative to today's date.
 
 RELEVANT COMPANY POLICIES:
 {policy_context if policy_context else "No policy documents are currently available."}
