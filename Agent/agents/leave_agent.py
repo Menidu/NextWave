@@ -6,6 +6,14 @@ from typing import Dict, Any, List, Optional, TypedDict
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
+import logging
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("LeaveAgent")
 
 
 class LeaveApplicationState(TypedDict):
@@ -39,6 +47,7 @@ class LeaveAgent:
             "https://www.googleapis.com/auth/chat.messages",
             "https://www.googleapis.com/auth/chat.spaces",
         ]
+        logger.info("LeaveAgent initialized.")
 
     async def _llm_text(self, system: str, payload: dict) -> str:
         try:
@@ -99,13 +108,15 @@ class LeaveAgent:
             
             self.leave_applications[application_id] = application
             
+            logger.info(f"Creating leave application for: {leave_data.get('requesterEmail')}")
+            
             return {
                 **state,
                 "applicationId": application_id,
                 "status": "created",
             }
         except Exception as error:
-            print(f"Error in validate_and_create_application: {error}")
+            logger.error(f"Error in validate_and_create_application: {error}", exc_info=True)
             apology = await self._llm_text(
                 "Write a brief, polite apology and ask the user to try again or share details.",
                 {"stage": "create_application", "error": str(error)},
@@ -113,12 +124,13 @@ class LeaveAgent:
             return {**state, "error": str(error), "finalMessage": apology or "Sorry, something went wrong. Could you try again?", "status": "failed"}
     
     async def check_calendar_conflicts(self, state: LeaveApplicationState) -> LeaveApplicationState:
-        """Step 2: Check for calendar conflicts"""
+        """Step 2: Check for calendar conflicts (always use Google Calendar tool first)"""
         try:
             leave_data = state["leaveData"]
-            
-            # Try Google Calendar tool first (if available)
+
+            # Always use Google Calendar tool
             tool_conflicts = await self.try_check_google_calendar(leave_data)
+            logger.info(f"Google Calendar conflicts: {tool_conflicts}")
             if tool_conflicts:
                 return {
                     **state,
@@ -126,7 +138,7 @@ class LeaveAgent:
                     "status": "conflicts_found",
                 }
 
-            # LLM-first conflict reasoning (fallback)
+            # If no conflicts found, fallback to LLM reasoning
             analysis = await self._llm_text(
                 "You are a scheduling assistant. Based on leave details, list potential conflicts (like long duration, month-end closings). Return newline-separated bullets; or 'none'.",
                 leave_data,
@@ -137,30 +149,35 @@ class LeaveAgent:
                     line = line.strip("- • \t ")
                     if line:
                         conflicts.append(line)
-            # Fallback heuristic if LLM returned nothing
             if not conflicts:
                 conflicts = await self.simulate_calendar_check(leave_data)
-            
+
+            logger.info(f"Checking calendar conflicts for application: {state.get('applicationId')}")
+
             return {
                 **state,
                 "conflicts": conflicts,
                 "status": "conflicts_found" if conflicts else "no_conflicts",
             }
         except Exception as error:
-            print(f"Error in check_calendar_conflicts: {error}")
+            logger.error(f"Error in check_calendar_conflicts: {error}", exc_info=True)
             apology = await self._llm_text(
                 "Briefly explain you couldn't analyze conflicts and ask user to proceed or adjust dates.",
                 {"stage": "conflicts", "error": str(error)},
             )
             return {**state, "error": str(error), "finalMessage": apology or "Couldn't analyze conflicts. Do you want to proceed?", "status": "failed"}
-    
+
     async def process_approval_workflow(self, state: LeaveApplicationState) -> LeaveApplicationState:
-        """Step 3: Process approval workflow"""
+        """Step 3: Process approval workflow (always send supervisor poll)"""
         try:
             leave_data = state["leaveData"]
             conflicts = state["conflicts"]
             application_id = state["applicationId"]
-            
+
+            print("leave data:", leave_data)
+
+            logger.info(f"Processing approval workflow for application: {state.get('applicationId')}")
+
             if conflicts:
                 message = await self._llm_text(
                     "Compose a concise message: request submitted, conflicts require manual review. Include bullets. End with polite expectation setting.",
@@ -168,9 +185,12 @@ class LeaveAgent:
                 )
                 if not message:
                     message = "Your request was submitted, but some conflicts need manual review. We'll update you soon.\n" + "\n".join(f"- {c}" for c in conflicts)
+                # Always send supervisor poll even if conflicts exist
+                poll_status = await self.try_send_supervisor_poll(leave_data, application_id)
+                message += f"\n\nSupervisor poll sent: {poll_status}"
                 return {**state, "approvalStatus": "requires_manual_review", "finalMessage": message, "status": "completed"}
-            
-            # Send supervisor poll card (tool), if supervisor email present
+
+            # Always send supervisor poll card (tool), if supervisor email present
             poll_status = await self.try_send_supervisor_poll(leave_data, application_id)
 
             # LLM-crafted approval message (status kept as pending_approval)
@@ -187,14 +207,14 @@ class LeaveAgent:
                 approval_result = {"status": "pending_approval", "message": msg or "Your request was submitted and is pending supervisor approval."}
             except Exception:
                 approval_result = await self.simulate_approval_process(leave_data)
-            
+
             # Update application status
             if application_id and application_id in self.leave_applications:
                 application = self.leave_applications[application_id]
                 application["approvalStatus"] = approval_result["status"]
                 application["approvedAt"] = datetime.now().isoformat()
                 self.leave_applications[application_id] = application
-            
+
             enhanced_message = f"{approval_result['message']}\n\nReference ID: {application_id}"
             return {
                 **state,
@@ -203,7 +223,7 @@ class LeaveAgent:
                 "status": "completed",
             }
         except Exception as error:
-            print(f"Error in process_approval_workflow: {error}")
+            logger.error(f"Error in process_approval_workflow: {error}", exc_info=True)
             apology = await self._llm_text(
                 "Briefly apologize and ask the user to retry the approval step later.",
                 {"stage": "approval", "error": str(error)},
@@ -235,8 +255,10 @@ class LeaveAgent:
                 if 25 <= day <= 31:
                     conflicts.append("Sick leave during month-end reporting period")
         
+            logger.info(f"Simulating calendar check for leave type: {leave_data.get('leaveType')}")
+        
         except Exception as error:
-            print(f"Error in simulate_calendar_check: {error}")
+            logger.error(f"Error in simulate_calendar_check: {error}", exc_info=True)
         
         return conflicts
     
@@ -246,6 +268,7 @@ class LeaveAgent:
             start_date = datetime.strptime(leave_data["startDate"], "%Y-%m-%d") if leave_data["startDate"].count("-") == 2 else datetime.now()
             end_date = datetime.strptime(leave_data["endDate"], "%Y-%m-%d") if leave_data["endDate"].count("-") == 2 else datetime.now()
             duration = max(1, (end_date - start_date).days + 1)
+            logger.info(f"Simulating approval process for: {leave_data.get('requesterEmail')}")
             return {
                 "status": "pending_approval",
                 "message": f"""⏳ Leave request submitted
@@ -260,7 +283,7 @@ class LeaveAgent:
 Your request is pending supervisor approval. You'll be notified once it's reviewed.""",
             }
         except Exception as error:
-            print(f"Error in simulate_approval_process: {error}")
+            logger.error(f"Error in simulate_approval_process: {error}", exc_info=True)
             return {
                 "status": "error",
                 "message": "Something went wrong while simulating the approval.",
@@ -311,9 +334,12 @@ Your request is pending supervisor approval. You'll be notified once it's review
                 title = ev.get('summary') or 'Busy'
                 start_time = (ev.get('start', {}) or {}).get('dateTime') or ev.get('start', {}).get('date')
                 conflicts.append(f"Overlaps with: {title} on {start_time}")
+            
+            logger.info(f"Checking Google Calendar for: {leave_data.get('requesterEmail')}")
+            
             return conflicts
         except Exception as error:
-            print(f"Calendar tool unavailable or failed: {error}")
+            logger.error(f"Calendar tool unavailable or failed: {error}", exc_info=True)
             return []
 
     async def try_send_supervisor_poll(self, leave_data: Dict[str, Any], application_id: Optional[str]) -> str:
@@ -335,12 +361,20 @@ Your request is pending supervisor approval. You'll be notified once it's review
             spaces = chat_service.spaces().list(pageSize=100).execute().get('spaces', [])
             dm_space = None
             for space in spaces:
-                if (space.get('spaceType') == 'DIRECT_MESSAGE' and 
-                    space.get('singleUserBotDm', {}).get('user', {}).get('email') == supervisor_email):
+                if (
+                    isinstance(space, dict) and
+                    space.get('spaceType') == 'DIRECT_MESSAGE' and 
+                    space.get('singleUserBotDm', {}) and
+                    isinstance(space.get('singleUserBotDm'), dict) and
+                    space.get('singleUserBotDm', {}).get('user', {}) and
+                    isinstance(space.get('singleUserBotDm', {}).get('user', {}), dict) and
+                    space.get('singleUserBotDm', {}).get('user', {}).get('email') == supervisor_email
+                ):
                     dm_space = space
                     break
+            # Fallback: use known chat space if DM not found
             if not dm_space:
-                return "no_dm_space"
+                dm_space = {"name": "spaces/ktippCAAAAE"}  # Fallback space
 
             start = leave_data.get('startDate')
             end = leave_data.get('endDate')
@@ -382,26 +416,29 @@ Your request is pending supervisor approval. You'll be notified once it's review
             }
 
             chat_service.spaces().messages().create(parent=dm_space['name'], body=card).execute()
+            logger.info(f"Sending supervisor poll for application: {application_id}")
             return "sent"
         except Exception as error:
-            print(f"Supervisor poll send failed: {error}")
+            logger.error(f"Supervisor poll send failed: {error}", exc_info=True)
             return "failed"
 
     def update_approval_status(self, application_id: str, decision: str) -> Optional[Dict[str, Any]]:
-        """Update application approval status based on supervisor decision."""
         app = self.leave_applications.get(application_id)
         if not app:
+            logger.warning(f"Application not found for update: {application_id}")
             return None
         status = "approved" if decision.lower() == "approve" else "denied"
         app["approvalStatus"] = status
         app["status"] = "completed"
         app["decisionAt"] = datetime.now().isoformat()
         self.leave_applications[application_id] = app
+        logger.info(f"Approval status updated for application {application_id}: {status}")
         return app
     
     async def process_leave_application(self, leave_data: Dict[str, Any]) -> Dict[str, Any]:
         """Main method to process leave application"""
         try:
+            logger.info(f"Processing leave application for: {leave_data.get('requesterEmail')}")
             initial_state: LeaveApplicationState = {
                 "leaveData": leave_data,
                 "applicationId": None,
@@ -425,7 +462,7 @@ Your request is pending supervisor approval. You'll be notified once it's review
                 "error": result.get("error"),
             }
         except Exception as error:
-            print(f"Error processing leave application: {error}")
+            logger.error(f"Error processing leave application: {error}", exc_info=True)
             return {
                 "success": False,
                 "message": "Unexpected error while processing your leave request. Please try again shortly.",
@@ -433,11 +470,11 @@ Your request is pending supervisor approval. You'll be notified once it's review
             }
     
     def get_application_status(self, application_id: str) -> Optional[Dict[str, Any]]:
-        """Get application status"""
         application = self.leave_applications.get(application_id)
         if not application:
+            logger.warning(f"Application status requested but not found: {application_id}")
             return None
-        
+        logger.info(f"Application status retrieved for: {application_id}")
         return {
             "id": application["id"],
             "status": application.get("status"),
@@ -448,5 +485,5 @@ Your request is pending supervisor approval. You'll be notified once it's review
         }
     
     def get_all_applications(self) -> List[Dict[str, Any]]:
-        """List all applications (for admin purposes)"""
+        logger.info("Retrieving all leave applications.")
         return list(self.leave_applications.values())
