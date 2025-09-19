@@ -8,13 +8,13 @@ class AgentManager:
         self.agentic = AgenticAgent()
         self.leave_agent = LeaveAgent()
     
-    async def process_message(self, user_message: str, user_email: str) -> Dict[str, Any]:
+    async def process_message(self, user_message: str, user_email: str, user_display_name: str = "") -> Dict[str, Any]:
         """Main entry point for processing user messages"""
         try:
             print(f"🤖 Processing message from {user_email}: \"{user_message}\"")
             
             # Process with the agentic graph
-            agent_result = await self.agentic.process_message(user_message, user_email)
+            agent_result = await self.agentic.process_message(user_message, user_email, user_display_name)
 
             route = agent_result.get("route")
             leave_data = agent_result.get("leaveData") or {}

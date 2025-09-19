@@ -12,15 +12,20 @@ except Exception:
     SqliteSaver = None  # Fallback to in-memory saver below
 from langgraph.checkpoint.memory import MemorySaver
 from .utils import clean_json_response, normalize_leave_dates
+from .policy_context import PolicyContext
 
 #gee
 class AgenticState(TypedDict, total=False):
     userEmail: str
+    userDisplayName: str
     lastUserMessage: str
     leaveData: Dict[str, Any]
     route: str
     finalMessage: str
     error: Optional[str]
+    missingFields: str
+    validationError: str
+    isFirstMessage: bool
 
 
 class AgenticAgent:
@@ -40,12 +45,16 @@ class AgenticAgent:
 
         # Runtime mapping to rotate thread IDs per user when resetting memory
         self.user_thread_ids: Dict[str, str] = {}
+        
+        # Initialize policy context
+        self.policy_context = PolicyContext(os.path.join(os.path.dirname(__file__), "..", "docs"))
 
         self.graph = self._build_graph()
 
     def _state_reducer(self):
         return {
             "userEmail": lambda x, y: y if y is not None else x,
+            "userDisplayName": lambda x, y: y if y is not None else x,
             "lastUserMessage": lambda x, y: y if y is not None else x,
             "leaveData": lambda x, y: y if y is not None else x or {},
             "route": lambda x, y: y if y is not None else x,
@@ -53,6 +62,7 @@ class AgenticAgent:
             "error": lambda x, y: y if y is not None else x,
             "missingFields": lambda x, y: y if y is not None else x,
             "validationError": lambda x, y: y if y is not None else x,
+            "isFirstMessage": lambda x, y: y if y is not None else x,
         }
 
     async def _decide_next(self, state: AgenticState) -> AgenticState:
@@ -90,6 +100,7 @@ class AgenticAgent:
             system = (
                 "You extract leave details from a friendly workplace chat.\n"
                 "Fields to capture: startDate, endDate, leaveType, reason, supervisorEmail.\n"
+                "For supervisorEmail: extract any email address mentioned, even if not explicitly labeled.\n"
                 "Return ONLY compact JSON with fields found (no prose)."
             )
             current = state.get("leaveData", {})
@@ -106,6 +117,13 @@ class AgenticAgent:
             except Exception:
                 updates = {}
 
+            # Extract email from message if not in updates
+            if not updates.get("supervisorEmail") and current.get("supervisorEmail"):
+                from .utils import extract_email
+                email = extract_email(state.get("lastUserMessage", ""))
+                if email:
+                    updates["supervisorEmail"] = email
+
             updated = {**current, **{k: v for k, v in updates.items() if v}}
             return {**state, "leaveData": updated}
         except Exception as error:
@@ -120,11 +138,18 @@ class AgenticAgent:
             if err:
                 # Route to crafted prompt with validation context
                 return {**state, "leaveData": normalized, "validationError": err}
+            
             required = ["startDate", "endDate", "leaveType", "reason", "supervisorEmail"]
             missing = [f for f in required if not normalized.get(f)]
+            
             if missing:
+                # Special handling for supervisor email - ask directly
+                if "supervisorEmail" in missing:
+                    return {**state, "leaveData": normalized, "finalMessage": "I need your supervisor's email address to send the approval request. Please provide it (e.g., john@company.com)."}
+                
                 # Route to crafted prompt with missing fields context
                 return {**state, "leaveData": normalized, "missingFields": missing}
+            
             return {**state, "leaveData": normalized, "route": "run_leave_workflow"}
         except Exception as error:
             msg = await self._llm_safe_message("Validation failed for leave inputs. Ask for the most critical missing/corrected field politely.")
@@ -134,16 +159,22 @@ class AgenticAgent:
         try:
             leave = state.get("leaveData", {})
             required = ["startDate", "endDate", "leaveType", "reason", "supervisorEmail"]
-            missing = [f for f in required if not leave.get(f)]
+            missing = state.get("missingFields") or [f for f in required if not leave.get(f)]
+            
+            # Special handling for supervisor email
+            if "supervisorEmail" in missing:
+                return {**state, "finalMessage": "I need your supervisor's email address to send the approval request. Please provide it (e.g., john@company.com)."}
+            
             system = (
-                "You are a friendly workplace assistant. Ask ONE concise, polite question to collect the next most important missing field (startDate, endDate, or leaveType first). "
+                "You are a friendly workplace assistant. Ask ONE concise, polite question to collect the next most important missing field. "
+                "Priority order: startDate, endDate, leaveType, reason. "
                 "If asking for a date, give a quick example (e.g., 2025-01-15 or 'next Monday'). Keep under 25 words."
             )
             messages = [
                 SystemMessage(content=system),
                 HumanMessage(content=json.dumps({
                     "latest": state.get("lastUserMessage", ""),
-                    "missing": state.get("missingFields") or missing,
+                    "missing": missing,
                     "validationError": state.get("validationError"),
                     "have": {k: v for k, v in leave.items() if v},
                 })),
@@ -156,9 +187,33 @@ class AgenticAgent:
 
     async def _general_chat(self, state: AgenticState) -> AgenticState:
         try:
-            system = (
-                "You are a friendly workplace assistant. Be professional, supportive, and concise. Offer actionable help and short examples when useful."
-            )
+            # Get intelligent policy context for the query using LLM
+            user_query = state.get("lastUserMessage", "")
+            policy_context = await self.policy_context.get_intelligent_policy_context(user_query, self.llm)
+            
+            # Create Mira's persona
+            display_name = state.get("userDisplayName", "")
+            first_name = display_name.split()[0] if display_name else "there"
+            is_first = state.get("isFirstMessage", False)
+            
+            greeting = f"Hello {first_name}! I'm Mira, your workplace assistant. " if is_first else ""
+            
+            system = f"""You are Mira, a friendly and helpful workplace assistant. You have access to company policies and can help with various workplace questions.
+
+{greeting}Be professional, supportive, and concise. Offer actionable help and short examples when useful.
+
+RELEVANT COMPANY POLICIES:
+{policy_context if policy_context else "No policy documents are currently available."}
+
+Instructions for policy questions:
+- When users ask about workplace policies, intelligently select and reference the relevant policy sections from the context above
+- Provide specific, actionable information based on the policies
+- If the user's question relates to multiple policies, reference all relevant sections
+- If you don't find specific information in the policies, be honest about it and suggest they contact HR
+- Always cite which policy section you're referencing (e.g., "According to our Leave Policy...")
+
+Always maintain a warm, helpful tone while being professional and accurate."""
+            
             messages = [
                 SystemMessage(content=system),
                 HumanMessage(content=state.get("lastUserMessage", "")),
@@ -223,13 +278,17 @@ class AgenticAgent:
 
         return workflow.compile(checkpointer=self.checkpointer)
 
-    async def process_message(self, user_message: str, user_email: str) -> Dict[str, Any]:
+    async def process_message(self, user_message: str, user_email: str, user_display_name: str = "") -> Dict[str, Any]:
+        # Check if this is the first message from this user
+        thread_id = self.user_thread_ids.get(user_email, user_email)
+        is_first_message = user_email not in self.user_thread_ids
+        
         initial: AgenticState = {
             "userEmail": user_email,
+            "userDisplayName": user_display_name,
             "lastUserMessage": user_message,
+            "isFirstMessage": is_first_message,
         }
-
-        thread_id = self.user_thread_ids.get(user_email, user_email)
 
         result = await self.graph.ainvoke(
             initial,

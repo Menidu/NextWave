@@ -7,6 +7,7 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 import logging
+from .policy_context import PolicyContext
 
 
 logging.basicConfig(
@@ -35,6 +36,9 @@ class LeaveAgent:
         
         # In-memory storage for leave applications (in production, use a database)
         self.leave_applications: Dict[str, Dict[str, Any]] = {}
+        
+        # Initialize policy context
+        self.policy_context = PolicyContext(os.path.join(os.path.dirname(__file__), "..", "docs"))
         
         # Build the LangGraph workflow
         self.workflow = self.build_workflow()
@@ -88,13 +92,37 @@ class LeaveAgent:
             ]
             
             if missing_fields:
-                prompt = await self._llm_text(
-                    "You are a friendly HR assistant. Ask for the missing leave fields in ONE short sentence (<=25 words).",
-                    {"missing": missing_fields, "current": leave_data},
-                )
-                if not prompt:
-                    prompt = f"Please provide: {', '.join(missing_fields)}."
+                # Special handling for supervisor email
+                if "supervisorEmail" in missing_fields:
+                    prompt = "I need your supervisor's email address to send the approval request. Please provide it (e.g., john@company.com)."
+                else:
+                    prompt = await self._llm_text(
+                        "You are a friendly HR assistant. Ask for the missing leave fields in ONE short sentence (<=25 words).",
+                        {"missing": missing_fields, "current": leave_data},
+                    )
+                    if not prompt:
+                        prompt = f"Please provide: {', '.join(missing_fields)}."
                 return {**state, "error": "missing_fields", "finalMessage": prompt, "status": "failed"}
+            
+            # Validate supervisor email format
+            supervisor_email = leave_data.get("supervisorEmail", "")
+            if supervisor_email and "@" not in supervisor_email:
+                return {**state, "error": "invalid_email", "finalMessage": "Please provide a valid supervisor email address (e.g., john@company.com).", "status": "failed"}
+            
+            # Validate against company policy using LLM
+            policy_validation = await self.policy_context.validate_leave_against_policy(leave_data, self.llm)
+            if not policy_validation["valid"]:
+                conflicts = policy_validation.get("conflicts", [])
+                warnings = policy_validation.get("warnings", [])
+                
+                conflict_message = "I found some policy conflicts with your leave request:\n" + "\n".join(f"• {conflict}" for conflict in conflicts)
+                if warnings:
+                    conflict_message += "\n\nAdditional considerations:\n" + "\n".join(f"• {warning}" for warning in warnings)
+                
+                return {**state, "error": "policy_conflict", "finalMessage": conflict_message, "status": "failed"}
+            
+            # Add policy warnings to the application if any
+            policy_warnings = policy_validation.get("warnings", [])
             
             # Create leave application record
             application = {
@@ -103,7 +131,7 @@ class LeaveAgent:
                 "submittedAt": datetime.now().isoformat(),
                 "status": "pending",
                 "requesterEmail": leave_data.get("requesterEmail"),
-                "supervisorEmail": leave_data.get("supervisorEmail"),
+                "supervisorEmail": supervisor_email,
             }
             
             self.leave_applications[application_id] = application
@@ -173,8 +201,6 @@ class LeaveAgent:
             leave_data = state["leaveData"]
             conflicts = state["conflicts"]
             application_id = state["applicationId"]
-
-            print("leave data:", leave_data)
 
             logger.info(f"Processing approval workflow for application: {state.get('applicationId')}")
 
@@ -349,15 +375,20 @@ Your request is pending supervisor approval. You'll be notified once it's review
         try:
             from google.oauth2 import service_account
             from googleapiclient.discovery import build
+            
             if not os.path.exists(self.service_account_file):
+                logger.warning("Service account file not found")
                 return "no_service_account"
+                
             creds = service_account.Credentials.from_service_account_file(self.service_account_file, scopes=self.chat_scopes)
             chat_service = build('chat', 'v1', credentials=creds)
 
             supervisor_email = leave_data.get("supervisorEmail")
-            if not supervisor_email:
-                return "missing_supervisor"
+            if not supervisor_email or "@" not in supervisor_email:
+                logger.warning(f"Invalid supervisor email: {supervisor_email}")
+                return "invalid_supervisor_email"
 
+            # Find DM space with supervisor
             spaces = chat_service.spaces().list(pageSize=100).execute().get('spaces', [])
             dm_space = None
             for space in spaces:
@@ -372,40 +403,46 @@ Your request is pending supervisor approval. You'll be notified once it's review
                 ):
                     dm_space = space
                     break
-            # Fallback: use known chat space if DM not found
+            
             if not dm_space:
-                dm_space = {"name": "spaces/ktippCAAAAE"}  # Fallback space
+                logger.warning(f"No DM space found with supervisor: {supervisor_email}")
+                return "no_dm_space"
 
-            start = leave_data.get('startDate')
-            end = leave_data.get('endDate')
-            leave_type = leave_data.get('leaveType')
-            reason = leave_data.get('reason')
-            requester = leave_data.get('requesterEmail')
-
-            # Build approval URLs from env (use same /chat/webhook endpoint)
+            # Build approval URLs
             base_url = os.getenv("APPROVAL_WEBHOOK_URL") or "http://localhost:3005"
             approve_url = f"{base_url}/chat/webhook?applicationId={application_id}&decision=approve" if application_id else "https://example.com/approve"
             deny_url = f"{base_url}/chat/webhook?applicationId={application_id}&decision=deny" if application_id else "https://example.com/deny"
 
-            # Simple card; interactive clicks go to our webhook URL
+            # Create approval card
+            start = leave_data.get('startDate', 'N/A')
+            end = leave_data.get('endDate', 'N/A')
+            leave_type = leave_data.get('leaveType', 'N/A')
+            reason = leave_data.get('reason', 'N/A')
+            requester = leave_data.get('requesterEmail', 'Unknown')
+
             card = {
                 "cardsV2": [
                     {
-                        "cardId": "leave-approval",
+                        "cardId": f"leave-approval-{application_id}",
                         "card": {
-                            "header": {"title": "Leave Approval Request", "subtitle": requester or "Requester"},
+                            "header": {
+                                "title": "Leave Approval Request", 
+                                "subtitle": f"From: {requester}"
+                            },
                             "sections": [
                                 {
                                     "widgets": [
-                                        {"textParagraph": {"text": f"<b>Type:</b> {leave_type}<br><b>Start:</b> {start}<br><b>End:</b> {end}<br><b>Reason:</b> {reason}"}},
+                                        {"textParagraph": {
+                                            "text": f"<b>Leave Type:</b> {leave_type}<br><b>Start Date:</b> {start}<br><b>End Date:</b> {end}<br><b>Reason:</b> {reason}<br><b>Application ID:</b> {application_id}"
+                                        }}
                                     ]
                                 },
                                 {
-                                    "header": "Actions",
+                                    "header": "Please choose:",
                                     "widgets": [
                                         {"buttonList": {"buttons": [
-                                            {"text": "Approve", "onClick": {"openLink": {"url": approve_url}}},
-                                            {"text": "Deny", "onClick": {"openLink": {"url": deny_url}}},
+                                            {"text": "✅ Approve", "onClick": {"openLink": {"url": approve_url}}},
+                                            {"text": "❌ Deny", "onClick": {"openLink": {"url": deny_url}}},
                                         ]}}
                                     ]
                                 }
@@ -416,8 +453,9 @@ Your request is pending supervisor approval. You'll be notified once it's review
             }
 
             chat_service.spaces().messages().create(parent=dm_space['name'], body=card).execute()
-            logger.info(f"Sending supervisor poll for application: {application_id}")
+            logger.info(f"Supervisor poll sent to {supervisor_email} for application: {application_id}")
             return "sent"
+            
         except Exception as error:
             logger.error(f"Supervisor poll send failed: {error}", exc_info=True)
             return "failed"

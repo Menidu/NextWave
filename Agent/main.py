@@ -287,8 +287,10 @@ async def webhook_handler(request: Request):
             # Extract event data
             space_name = event.get("chat", {}).get("messagePayload", {}).get("space", {}).get("name")
             message_text = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("text")
-            sender_email = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("sender", {}).get("email")
-            sender_type = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("sender", {}).get("type")
+            sender_info = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("sender", {})
+            sender_email = sender_info.get("email")
+            sender_type = sender_info.get("type")
+            sender_display_name = sender_info.get("displayName", "")
             
             if not space_name or not message_text:
                 print("⚠️ No space name or message text found in event")
@@ -301,7 +303,7 @@ async def webhook_handler(request: Request):
 
             # Process in background (simulate async processing)
             import asyncio
-            asyncio.create_task(process_webhook_message(space_name, message_text, sender_email))
+            asyncio.create_task(process_webhook_message(space_name, message_text, sender_email, sender_display_name))
             
             return response
         
@@ -309,7 +311,7 @@ async def webhook_handler(request: Request):
         print(f"❌ Failed to process webhook: {error}")
         return JSONResponse(content={}, status_code=200)
 
-async def process_webhook_message(space_name: str, message_text: str, sender_email: str):
+async def process_webhook_message(space_name: str, message_text: str, sender_email: str, sender_display_name: str = ""):
     """Process webhook message in background"""
     try:
         print(f"💡 Processing message with multi-agent system: \"{message_text}\"")
@@ -319,7 +321,7 @@ async def process_webhook_message(space_name: str, message_text: str, sender_ema
             return
         
         # Process message with the multi-agent system
-        agent_result = await agent_manager.process_message(message_text, sender_email)
+        agent_result = await agent_manager.process_message(message_text, sender_email, sender_display_name)
         
         if agent_result["success"]:
             print(f"💬 Sending agent response to {space_name}...")
