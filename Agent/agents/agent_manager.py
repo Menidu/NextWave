@@ -8,7 +8,7 @@ class AgentManager:
         self.agentic = AgenticAgent()
         self.leave_agent = LeaveAgent()
     
-    async def process_message(self, user_message: str, user_email: str, user_display_name: str = "") -> Dict[str, Any]:
+    async def process_message(self, user_message: str, user_email: str, user_display_name: str = "", space_name: str = "") -> Dict[str, Any]:
         """Main entry point for processing user messages"""
         try:
             print(f"🤖 Processing message from {user_email}: \"{user_message}\"")
@@ -27,6 +27,8 @@ class AgentManager:
                 print("📋 Leave data ready, invoking Leave Agent...")
                 extracted_data = dict(leave_data)
                 extracted_data.setdefault("requesterEmail", user_email)
+                if space_name:
+                    extracted_data.setdefault("requesterSpaceName", space_name)
 
                 leave_agent_result = await self.leave_agent.process_leave_application(extracted_data)
 

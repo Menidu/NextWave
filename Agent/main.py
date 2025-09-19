@@ -321,7 +321,7 @@ async def process_webhook_message(space_name: str, message_text: str, sender_ema
             return
         
         # Process message with the multi-agent system
-        agent_result = await agent_manager.process_message(message_text, sender_email, sender_display_name)
+        agent_result = await agent_manager.process_message(message_text, sender_email, sender_display_name, space_name)
         
         if agent_result["success"]:
             print(f"💬 Sending agent response to {space_name}...")

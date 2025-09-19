@@ -443,19 +443,24 @@ Your request is pending supervisor approval. You'll be notified once it's review
                     logger.info(f"Using DM space: {space.get('name')} (no email verification possible)")
                     break
             
-            # Fallback: If no DM space found, try to find a regular space with the supervisor
+            # Fallback: Use requester's current chat space (provided by caller) if available
             if not dm_space:
-                logger.warning(f"No DM space available, trying to find supervisor in regular spaces")
-                for space in spaces:
-                    if (
-                        isinstance(space, dict) and
-                        space.get('spaceType') == 'ROOM' and
-                        space.get('name')  # Regular chat space
-                    ):
-                        # In production, you'd check if supervisor is a member of this space
-                        dm_space = space
-                        logger.info(f"Using fallback space: {space.get('name')}")
-                        break
+                requester_space = leave_data.get("requesterSpaceName")
+                if requester_space:
+                    dm_space = {"name": requester_space}
+                    logger.info(f"Using requester's space as fallback: {requester_space}")
+                else:
+                    # As a last resort, pick any available space (room) to avoid dropping the request
+                    logger.warning("No DM or requester space available, attempting generic room fallback")
+                    for space in spaces:
+                        if (
+                            isinstance(space, dict) and
+                            space.get('spaceType') in ('ROOM', 'SPACE') and
+                            space.get('name')
+                        ):
+                            dm_space = space
+                            logger.info(f"Using generic fallback space: {space.get('name')}")
+                            break
             
             if not dm_space:
                 logger.warning(f"No suitable space found for supervisor: {supervisor_email}")
