@@ -382,10 +382,10 @@ Your request is pending supervisor approval. You'll be notified once it's review
             reason = leave_data.get('reason')
             requester = leave_data.get('requesterEmail')
 
-            # Build approval URLs from env
-            base_url = os.getenv("APPROVAL_WEBHOOK_URL") or ""
-            approve_url = f"{base_url}?applicationId={application_id}&decision=approve" if base_url and application_id else "https://example.com/approve"
-            deny_url = f"{base_url}?applicationId={application_id}&decision=deny" if base_url and application_id else "https://example.com/deny"
+            # Build approval URLs from env (use same /chat/webhook endpoint)
+            base_url = os.getenv("APPROVAL_WEBHOOK_URL") or "http://localhost:3005"
+            approve_url = f"{base_url}/chat/webhook?applicationId={application_id}&decision=approve" if application_id else "https://example.com/approve"
+            deny_url = f"{base_url}/chat/webhook?applicationId={application_id}&decision=deny" if application_id else "https://example.com/deny"
 
             # Simple card; interactive clicks go to our webhook URL
             card = {

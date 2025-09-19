@@ -239,55 +239,71 @@ async def reset_user_state(request: ResetUserRequest):
         print(f"❌ Error resetting user state: {error}")
         raise HTTPException(status_code=500, detail=str(error))
 
-# Webhook handler
-@app.post("/chat/webhook")
+
+# Webhook handler (supports both GET for approval buttons and POST for chat messages)
+@app.api_route("/chat/webhook", methods=["GET", "POST"])
 async def webhook_handler(request: Request):
     try:
-        event = await request.json()
-        print("🔔 Incoming webhook event:", json.dumps(event, indent=2))
-        
-        # Always respond immediately
-        response = JSONResponse(content={}, status_code=200)
-        
-        # Extract event data
-        space_name = event.get("chat", {}).get("messagePayload", {}).get("space", {}).get("name")
-        message_text = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("text")
-        sender_email = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("sender", {}).get("email")
-        sender_type = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("sender", {}).get("type")
-        
-        if not space_name or not message_text:
-            print("⚠️ No space name or message text found in event")
-            return response
-        
-        # Skip processing if the message is from the bot itself
-        if sender_type == "BOT":
-            print("🤖 Skipping bot message")
-            return response
-        
-        # Supervisor approval webhook via query/body
-        application_id = event.get("applicationId")
-        decision = event.get("decision")
-        if application_id and decision and agent_manager:
-            try:
+        # Handle GET requests (approval buttons)
+        if request.method == "GET":
+            application_id = request.query_params.get("applicationId")
+            decision = request.query_params.get("decision")
+            
+            if application_id and decision and agent_manager:
+                print(f"🔔 Approval webhook received: {application_id} -> {decision}")
+                
+                # Update application status
                 updated = agent_manager.leave_agent.update_approval_status(application_id, decision)
-                if updated:
-                    # Notify requester via Chat if available
-                    requester = updated.get("requesterEmail")
-                    message_text = f"Your leave request ({application_id}) was {updated.get('approvalStatus')} by your supervisor."
-                    if requester:
-                        try:
-                            await send_message_to_user(requester, message_text)
-                        except Exception as _:
-                            pass
-                    print(f"✅ Approval updated: {application_id} -> {updated.get('approvalStatus')}")
-            except Exception as err:
-                print(f"❌ Failed to update approval: {err}")
-
-        # Process in background (simulate async processing)
-        import asyncio
-        asyncio.create_task(process_webhook_message(space_name, message_text, sender_email))
+                if not updated:
+                    return JSONResponse(content={"error": "Application not found"}, status_code=404)
+                
+                # Notify requester via Chat if available
+                requester = updated.get("requesterEmail")
+                if requester:
+                    try:
+                        message_text = f"Your leave request ({application_id}) was {updated.get('approvalStatus')} by your supervisor."
+                        await send_message_to_user(requester, message_text)
+                        print(f"✅ Notified requester {requester} about {updated.get('approvalStatus')} decision")
+                    except Exception as notify_error:
+                        print(f"⚠️ Could not notify requester: {notify_error}")
+                
+                return JSONResponse(content={
+                    "success": True, 
+                    "message": f"Leave request {updated.get('approvalStatus')} successfully",
+                    "applicationId": application_id,
+                    "status": updated.get("approvalStatus")
+                })
+            else:
+                return JSONResponse(content={"error": "Missing applicationId or decision"}, status_code=400)
         
-        return response
+        # Handle POST requests (chat messages)
+        else:
+            event = await request.json()
+            print("🔔 Incoming webhook event:", json.dumps(event, indent=2))
+            
+            # Always respond immediately
+            response = JSONResponse(content={}, status_code=200)
+            
+            # Extract event data
+            space_name = event.get("chat", {}).get("messagePayload", {}).get("space", {}).get("name")
+            message_text = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("text")
+            sender_email = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("sender", {}).get("email")
+            sender_type = event.get("chat", {}).get("messagePayload", {}).get("message", {}).get("sender", {}).get("type")
+            
+            if not space_name or not message_text:
+                print("⚠️ No space name or message text found in event")
+                return response
+            
+            # Skip processing if the message is from the bot itself
+            if sender_type == "BOT":
+                print("🤖 Skipping bot message")
+                return response
+
+            # Process in background (simulate async processing)
+            import asyncio
+            asyncio.create_task(process_webhook_message(space_name, message_text, sender_email))
+            
+            return response
         
     except Exception as error:
         print(f"❌ Failed to process webhook: {error}")
