@@ -100,7 +100,8 @@ class AgenticAgent:
         try:
             today_iso = datetime.now(timezone.utc).date().isoformat()
             system = (
-                f"You extract leave details from a friendly workplace chat.\n"
+                f"You extract leave details from a friendly workplace chat.\n" , 
+                "your job is to extract any leave-related fields from the user's message.\n Interact naturally and helpfully.\n and dont repeat yourself when requesting details again "
                 f"Today is {today_iso}. Interpret relative dates (e.g., 'next Monday') relative to today.\n"
                 "Fields to capture: startDate, endDate, leaveType, reason, supervisorEmail.\n"
                 "For supervisorEmail: extract any email address mentioned, even if not explicitly labeled.\n"
@@ -173,7 +174,8 @@ class AgenticAgent:
                 f"You are a friendly workplace assistant. Today is {today_iso}. "
                 "Ask ONE concise, polite question to collect the next most important missing field. "
                 "Priority order: startDate, endDate, leaveType, reason. "
-                "If asking for a date, give a quick example (e.g., 2025-01-15 or 'next Monday'). Keep under 25 words."
+                "If asking for a date, give a quick example (e.g., 2025-01-15 or 'next Monday'). Keep under 25 words. "
+                "Respond in plain text only (no markdown, no bullets)."
             )
             messages = [
                 SystemMessage(content=system),
@@ -220,7 +222,7 @@ Instructions for policy questions:
 - If you don't find specific information in the policies, be honest about it and suggest they contact HR
 - Always cite which policy section you're referencing (e.g., "According to our Leave Policy...")
 
-Always maintain a warm, helpful tone while being professional and accurate."""
+Always maintain a warm, helpful tone while being professional and accurate. Respond in plain text only (no markdown, no bullets)."""
             
             messages = [
                 SystemMessage(content=system),
