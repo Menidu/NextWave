@@ -211,20 +211,20 @@ class LeaveAgent:
             logger.info(f"Processing approval workflow for application: {state.get('applicationId')}")
 
             if conflicts:
-                # Format conflicts more descriptively
+                # Format conflicts as plain sentences (no bullets/markdown)
                 formatted_conflicts = []
                 for conflict in conflicts:
-                    if "You have" in conflict:
-                        formatted_conflicts.append(f"• {conflict}")
-                    else:
-                        formatted_conflicts.append(f"• {conflict}")
-                
+                    text = conflict.strip().lstrip("-• ")
+                    if not text.endswith("."):
+                        text = text + "."
+                    formatted_conflicts.append(text)
+
                 message = await self._llm_text(
-                    "Compose a concise message: request submitted, calendar conflicts require manual review. List the conflicts clearly. End with polite expectation setting.",
+                    "Compose a concise message in plain text (no markdown): request submitted, calendar conflicts require manual review. List the conflicts clearly as sentences. End with polite expectation setting.",
                     {"applicationId": application_id, "conflicts": formatted_conflicts, "leave": leave_data},
                 )
                 if not message:
-                    message = "Your request was submitted, but some calendar conflicts need manual review. We'll update you soon.\n\n" + "\n".join(formatted_conflicts)
+                    message = "Your request was submitted, but some calendar conflicts need manual review. We'll update you soon. " + " ".join(formatted_conflicts)
                 # Always send supervisor poll even if conflicts exist
                 poll_status = await self.try_send_supervisor_poll(leave_data, application_id)
                 message += f"\n\nSupervisor poll sent: {poll_status}"
@@ -311,16 +311,12 @@ class LeaveAgent:
             logger.info(f"Simulating approval process for: {leave_data.get('requesterEmail')}")
             return {
                 "status": "pending_approval",
-                "message": f"""⏳ Leave request submitted
-
-📅 Details
-- Start: {leave_data['startDate']}
-- End: {leave_data['endDate']}
-- Type: {leave_data['leaveType']}
-- Duration: {duration} day(s)
-- Reason: {leave_data['reason']}
-
-Your request is pending supervisor approval. You'll be notified once it's reviewed.""",
+                "message": (
+                    f"Leave request submitted. "
+                    f"Details: Start {leave_data['startDate']}, End {leave_data['endDate']}, "
+                    f"Type {leave_data['leaveType']}, Duration {duration} day(s), Reason {leave_data['reason']}. "
+                    "Your request is pending supervisor approval. You'll be notified once it's reviewed."
+                ),
             }
         except Exception as error:
             logger.error(f"Error in simulate_approval_process: {error}", exc_info=True)
