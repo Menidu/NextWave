@@ -14,6 +14,7 @@ except Exception:
 from langgraph.checkpoint.memory import MemorySaver
 from .utils import clean_json_response, normalize_leave_dates
 from .policy_context import PolicyContext
+from .rm_agent import RMAgent
 
 #gee
 class AgenticState(TypedDict, total=False):
@@ -27,6 +28,7 @@ class AgenticState(TypedDict, total=False):
     missingFields: str
     validationError: str
     isFirstMessage: bool
+    userContext: Dict[str, Any]
 
 
 class AgenticAgent:
@@ -49,6 +51,9 @@ class AgenticAgent:
         
         # Initialize policy context
         self.policy_context = PolicyContext(os.path.join(os.path.dirname(__file__), "..", "docs"))
+        
+        # Initialize RM Agent
+        self.rm_agent = RMAgent()
 
         self.graph = self._build_graph()
 
@@ -64,10 +69,18 @@ class AgenticAgent:
             "missingFields": lambda x, y: y if y is not None else x,
             "validationError": lambda x, y: y if y is not None else x,
             "isFirstMessage": lambda x, y: y if y is not None else x,
+            "userContext": lambda x, y: y if y is not None else x,
         }
 
     async def _decide_next(self, state: AgenticState) -> AgenticState:
         try:
+            # Check if this is an RM-related query first
+            user_message = state.get('lastUserMessage', '')
+            is_rm_query = await self.rm_agent.is_rm_related_query(user_message)
+            
+            if is_rm_query:
+                return {**state, "route": "rm_query"}
+            
             system = (
                 "You orchestrate a friendly workplace assistant. Decide the next step from the latest user message and partial leave data.\n\n"
                 "ROUTE RULES (pick exactly one):\n"
@@ -79,7 +92,7 @@ class AgenticAgent:
             messages = [
                 SystemMessage(content=system),
                 HumanMessage(content=json.dumps({
-                    "message": state.get("lastUserMessage", ""),
+                    "message": user_message,
                     "leaveData": state.get("leaveData", {}),
                 })),
             ]
@@ -234,6 +247,20 @@ Always maintain a warm, helpful tone while being professional and accurate. Resp
             msg = await self._llm_safe_message("Provide a brief, friendly apology and ask how to help further.")
             return {**state, "error": str(error), "finalMessage": msg}
 
+    async def _rm_query(self, state: AgenticState) -> AgenticState:
+        """Handle RM-related queries using RM Agent"""
+        try:
+            user_email = state.get("userEmail", "")
+            user_message = state.get("lastUserMessage", "")
+            user_context = state.get("userContext", {})
+            
+            # Process RM query with user context
+            response = await self.rm_agent.process_rm_query(user_message, user_email, user_context)
+            return {**state, "finalMessage": response}
+        except Exception as error:
+            msg = await self._llm_safe_message("I encountered an error processing your RM query. Please try again or contact HR.")
+            return {**state, "error": str(error), "finalMessage": msg}
+
     def _build_graph(self):
         workflow = StateGraph(AgenticState)
         workflow.add_node("decide_next", self._decide_next)
@@ -241,6 +268,7 @@ Always maintain a warm, helpful tone while being professional and accurate. Resp
         workflow.add_node("validate_leave", self._validate_leave)
         workflow.add_node("craft_prompt", self._craft_prompt)
         workflow.add_node("general_chat", self._general_chat)
+        workflow.add_node("rm_query", self._rm_query)
 
         # Entry and routing
         workflow.set_entry_point("decide_next")
@@ -251,6 +279,8 @@ Always maintain a warm, helpful tone while being professional and accurate. Resp
                 return "collect_leave"
             if route == "run_leave_workflow":
                 return "run_leave_workflow"
+            if route == "rm_query":
+                return "rm_query"
             return "general_chat"
 
         workflow.add_conditional_edges(
@@ -259,6 +289,7 @@ Always maintain a warm, helpful tone while being professional and accurate. Resp
             {
                 "collect_leave": "collect_leave",
                 "general_chat": "general_chat",
+                "rm_query": "rm_query",
                 "run_leave_workflow": END,
             },
         )
@@ -293,11 +324,17 @@ Always maintain a warm, helpful tone while being professional and accurate. Resp
         thread_id = self.user_thread_ids.get(user_email, user_email)
         is_first_message = user_email not in self.user_thread_ids
         
+        # Retrieve user context on first message
+        user_context = {}
+        if is_first_message:
+            user_context = await self.rm_agent.get_user_data(user_email) or {}
+        
         initial: AgenticState = {
             "userEmail": user_email,
             "userDisplayName": user_display_name,
             "lastUserMessage": user_message,
             "isFirstMessage": is_first_message,
+            "userContext": user_context,
         }
 
         result = await self.graph.ainvoke(

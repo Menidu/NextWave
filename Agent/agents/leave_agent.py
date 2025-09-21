@@ -8,6 +8,7 @@ from langchain_core.messages import HumanMessage, SystemMessage
 from langgraph.graph import StateGraph, END
 import logging
 from .policy_context import PolicyContext
+from .rm_agent import RMAgent
 
 
 logging.basicConfig(
@@ -39,6 +40,9 @@ class LeaveAgent:
         
         # Initialize policy context
         self.policy_context = PolicyContext(os.path.join(os.path.dirname(__file__), "..", "docs"))
+        
+        # Initialize RM Agent for supervisor space lookup
+        self.rm_agent = RMAgent()
         
         # Build the LangGraph workflow
         self.workflow = self.build_workflow()
@@ -422,45 +426,36 @@ class LeaveAgent:
                 logger.warning(f"Invalid supervisor email: {supervisor_email}")
                 return "invalid_supervisor_email"
 
-            # Find DM space with supervisor (DM spaces don't contain user emails, so we'll use fallback)
-            spaces = chat_service.spaces().list(pageSize=100).execute().get('spaces', [])
-            dm_space = None
+            # Get supervisor's chatspace from database using RM Agent
+            requester_email = leave_data.get("requesterEmail")
+            supervisor_chatspace = None
             
-            # First try to find DM space (though it won't have user emails)
-            for space in spaces:
-                if (
-                    isinstance(space, dict) and
-                    space.get('spaceType') == 'DIRECT_MESSAGE' and 
-                    space.get('singleUserBotDm', False)
-                ):
-                    # Since DM spaces don't contain user emails, we'll use the first available DM space
-                    # In production, you'd have a database mapping supervisor emails to DM space names
-                    dm_space = space
-                    logger.info(f"Using DM space: {space.get('name')} (no email verification possible)")
-                    break
+            if requester_email:
+                supervisor_chatspace = await self.rm_agent.get_supervisor_chatspace(requester_email)
             
-            # Fallback: Use requester's current chat space (provided by caller) if available
-            if not dm_space:
-                requester_space = leave_data.get("requesterSpaceName")
-                if requester_space:
-                    dm_space = {"name": requester_space}
-                    logger.info(f"Using requester's space as fallback: {requester_space}")
-                else:
-                    # As a last resort, pick any available space (room) to avoid dropping the request
-                    logger.warning("No DM or requester space available, attempting generic room fallback")
-                    for space in spaces:
-                        if (
-                            isinstance(space, dict) and
-                            space.get('spaceType') in ('ROOM', 'SPACE') and
-                            space.get('name')
-                        ):
-                            dm_space = space
-                            logger.info(f"Using generic fallback space: {space.get('name')}")
-                            break
-            
-            if not dm_space:
-                logger.warning(f"No suitable space found for supervisor: {supervisor_email}")
-                return "no_space_available"
+            if supervisor_chatspace:
+                # Use supervisor's chatspace from database
+                dm_space = {"name": supervisor_chatspace}
+                logger.info(f"Using supervisor's chatspace from database: {supervisor_chatspace}")
+            else:
+                # Fallback: Find any available space
+                spaces = chat_service.spaces().list(pageSize=100).execute().get('spaces', [])
+                dm_space = None
+                
+                # Try to find any available space
+                for space in spaces:
+                    if (
+                        isinstance(space, dict) and
+                        space.get('spaceType') in ('ROOM', 'SPACE', 'DIRECT_MESSAGE') and
+                        space.get('name')
+                    ):
+                        dm_space = space
+                        logger.info(f"Using fallback space: {space.get('name')}")
+                        break
+                
+                if not dm_space:
+                    logger.warning(f"No suitable space found for supervisor: {supervisor_email}")
+                    return "no_space_available"
 
             # Build approval URLs
             base_url = os.getenv("APPROVAL_WEBHOOK_URL") or "http://localhost:3005"
