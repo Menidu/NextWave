@@ -74,38 +74,41 @@ class AgenticAgent:
 
     async def _decide_next(self, state: AgenticState) -> AgenticState:
         try:
-            # Check if this is an RM-related query first
             user_message = state.get('lastUserMessage', '')
-            is_rm_query = await self.rm_agent.is_rm_related_query(user_message)
+            leave_data = state.get("leaveData", {})
             
-            if is_rm_query:
+            # Simple keyword-based routing for reliability
+            message_lower = user_message.lower()
+            
+            # Check for RM-related keywords first
+            rm_keywords = [
+                "supervisor", "department", "employee", "team", "role", "employee id", 
+                "hire", "manager", "hr", "organization", "staff", "colleague", "my info",
+                "who am i", "what am i", "employee details", "personal info"
+            ]
+            
+            if any(keyword in message_lower for keyword in rm_keywords):
                 return {**state, "route": "rm_query"}
             
-            system = (
-                "You orchestrate a friendly workplace assistant. Decide the next step from the latest user message and partial leave data.\n\n"
-                "ROUTE RULES (pick exactly one):\n"
-                "- collect_leave: user is talking about time off/leave OR providing details; we should extract/update fields.\n"
-                "- run_leave_workflow: ALL REQUIRED fields present (startDate, endDate, leaveType, reason, supervisorEmail).\n"
-                "- general_chat: everything else (answer helpfully).\n\n"
-                "Respond ONLY with JSON: {\"route\": \"collect_leave|run_leave_workflow|general_chat\"}"
-            )
-            messages = [
-                SystemMessage(content=system),
-                HumanMessage(content=json.dumps({
-                    "message": user_message,
-                    "leaveData": state.get("leaveData", {}),
-                })),
+            # Check for leave-related keywords
+            leave_keywords = [
+                "leave", "vacation", "sick", "time off", "absence", "holiday", 
+                "day off", "personal day", "maternity", "paternity", "emergency leave"
             ]
-            resp = await self.llm.ainvoke(messages)
-            content = clean_json_response(resp.content)
-            try:
-                data = json.loads(content)
-                route = data.get("route")
-                if route not in {"collect_leave", "run_leave_workflow", "general_chat"}:
-                    route = "general_chat"
-            except Exception:
-                route = "general_chat"
-            return {**state, "route": route}
+            
+            if any(keyword in message_lower for keyword in leave_keywords):
+                # Check if we have all required fields
+                required_fields = ["startDate", "endDate", "leaveType", "reason", "supervisorEmail"]
+                has_all_fields = all(leave_data.get(field) for field in required_fields)
+                
+                if has_all_fields:
+                    return {**state, "route": "run_leave_workflow"}
+                else:
+                    return {**state, "route": "collect_leave"}
+            
+            # Everything else goes to general chat
+            return {**state, "route": "general_chat"}
+            
         except Exception as error:
             return {**state, "route": "general_chat", "error": str(error)}
 
@@ -207,58 +210,95 @@ class AgenticAgent:
 
     async def _general_chat(self, state: AgenticState) -> AgenticState:
         try:
-            # Get intelligent policy context for the query using LLM
             user_query = state.get("lastUserMessage", "")
-            policy_context = await self.policy_context.get_intelligent_policy_context(user_query, self.llm)
-            
-            # Create Mira's persona
+            user_context = state.get("userContext", {})
             display_name = state.get("userDisplayName", "")
             first_name = display_name.split()[0] if display_name else "there"
             is_first = state.get("isFirstMessage", False)
             
             greeting = f"Hello {first_name}! I'm Mira, your workplace assistant. " if is_first else ""
             
-            today_iso = datetime.now(timezone.utc).date().isoformat()
-            system = f"""You are Mira, a friendly and helpful workplace assistant. You have access to company policies and can help with various workplace questions.
-
-{greeting}Be professional, supportive, and concise. Offer actionable help and short examples when useful.
-
-Today's date: {today_iso}. When the user mentions relative dates (e.g., "next Monday"), interpret them relative to today's date.
-
-RELEVANT COMPANY POLICIES:
-{policy_context if policy_context else "No policy documents are currently available."}
-
-Instructions for policy questions:
-- When users ask about workplace policies, intelligently select and reference the relevant policy sections from the context above
-- Provide specific, actionable information based on the policies
-- If the user's question relates to multiple policies, reference all relevant sections
-- If you don't find specific information in the policies, be honest about it and suggest they contact HR
-- Always cite which policy section you're referencing (e.g., "According to our Leave Policy...")
-
-Always maintain a warm, helpful tone while being professional and accurate. Respond in plain text only (no markdown, no bullets)."""
+            # Check if this might be an RM query that wasn't caught by routing
+            message_lower = user_query.lower()
+            rm_hints = ["my", "i am", "i work", "my team", "my department"]
             
-            messages = [
-                SystemMessage(content=system),
-                HumanMessage(content=state.get("lastUserMessage", "")),
-            ]
-            resp = await self.llm.ainvoke(messages)
-            return {**state, "finalMessage": resp.content}
+            if any(hint in message_lower for hint in rm_hints) and not user_context:
+                # Try to get user context for potential RM query
+                user_email = state.get("userEmail", "")
+                if user_email:
+                    user_context = await self.rm_agent.get_user_data(user_email)
+                    if user_context:
+                        # This is actually an RM query, handle it
+                        return await self._rm_query({**state, "userContext": user_context})
+            
+            # Get policy context
+            try:
+                policy_context = await self.policy_context.get_intelligent_policy_context(user_query, self.llm)
+            except Exception:
+                policy_context = "No policy documents are currently available."
+            
+            today_iso = datetime.now(timezone.utc).date().isoformat()
+            
+            # Create a helpful response based on query type
+            if "policy" in message_lower or "dress code" in message_lower or "safety" in message_lower:
+                response = f"{greeting}I can help you with workplace policies. {policy_context[:200]}... For more specific information, please contact HR."
+            elif "help" in message_lower or "what can you do" in message_lower:
+                response = f"{greeting}I can help you with:\n- Leave applications and time off requests\n- Workplace policies and procedures\n- Employee information (if you're in our database)\n- General workplace questions\n\nWhat would you like to know?"
+            elif "hello" in message_lower or "hi" in message_lower:
+                response = f"{greeting}How can I help you today? I can assist with leave requests, workplace policies, or answer general questions."
+            else:
+                response = f"{greeting}I'm here to help with workplace questions, leave requests, and policies. Could you be more specific about what you need assistance with?"
+            
+            return {**state, "finalMessage": response}
+            
         except Exception as error:
-            msg = await self._llm_safe_message("Provide a brief, friendly apology and ask how to help further.")
+            msg = f"Hello! I'm Mira, your workplace assistant. I'm having trouble processing your request right now. Please try again or contact HR for assistance."
             return {**state, "error": str(error), "finalMessage": msg}
 
     async def _rm_query(self, state: AgenticState) -> AgenticState:
-        """Handle RM-related queries using RM Agent"""
+        """Handle RM-related queries using RM Agent as a tool"""
         try:
             user_email = state.get("userEmail", "")
             user_message = state.get("lastUserMessage", "")
             user_context = state.get("userContext", {})
             
-            # Process RM query with user context
-            response = await self.rm_agent.process_rm_query(user_message, user_email, user_context)
+            # Get user data if not already available
+            if not user_context:
+                user_context = await self.rm_agent.get_user_data(user_email)
+            
+            # Create a more helpful response using the RM Agent as a tool
+            if user_context:
+                # User found in database - provide personalized response
+                name = user_context.get('name', 'there')
+                department = user_context.get('department', 'your department')
+                role = user_context.get('role', 'your role')
+                supervisor = user_context.get('supervisor_name', 'your supervisor')
+                employee_id = user_context.get('employee_id', 'your employee ID')
+                
+                # Generate response based on query type
+                message_lower = user_message.lower()
+                
+                if "supervisor" in message_lower:
+                    response = f"Hi {name}! Your supervisor is {supervisor} ({user_context.get('supervisor_email', '')})."
+                elif "department" in message_lower:
+                    response = f"Hi {name}! You work in the {department} department."
+                elif "role" in message_lower or "job" in message_lower:
+                    response = f"Hi {name}! Your role is {role} in the {department} department."
+                elif "employee id" in message_lower or "id" in message_lower:
+                    response = f"Hi {name}! Your employee ID is {employee_id}."
+                elif "hire" in message_lower or "join" in message_lower:
+                    hire_date = user_context.get('hire_date', 'your hire date')
+                    response = f"Hi {name}! You joined the company on {hire_date}."
+                else:
+                    response = f"Hi {name}! Here's your information: You're a {role} in the {department} department. Your supervisor is {supervisor} and your employee ID is {employee_id}."
+            else:
+                # User not found - provide general assistance
+                response = f"I don't have your specific information in the database. Please contact HR for your employee details, or you can ask me about general workplace policies and procedures."
+            
             return {**state, "finalMessage": response}
+            
         except Exception as error:
-            msg = await self._llm_safe_message("I encountered an error processing your RM query. Please try again or contact HR.")
+            msg = f"I encountered an error while looking up your information. Please try again or contact HR for assistance."
             return {**state, "error": str(error), "finalMessage": msg}
 
     def _build_graph(self):

@@ -116,7 +116,7 @@ class RMAgent:
             if not user_context:
                 user_context = await self.get_user_data(user_email)
             
-            # Create context for LLM
+            # Create context for LLM with fallback handling
             context_info = ""
             if user_context:
                 context_info = f"""
@@ -130,6 +130,12 @@ USER CONTEXT:
 - Location: {user_context.get('location', 'Unknown')}
 - Supervisor: {user_context.get('supervisor_name', 'Unknown')} ({user_context.get('supervisor_email', 'Unknown')})
 """
+            else:
+                context_info = f"""
+USER CONTEXT:
+- Email: {user_email}
+- Note: User information not found in database. Provide general assistance and suggest contacting HR for specific details.
+"""
             
             system = f"""You are a Resource Management (RM) assistant. You help users with HR, employee, and organizational questions.
 
@@ -137,10 +143,12 @@ USER CONTEXT:
 
 Instructions:
 - Answer questions about employees, departments, organizational structure, HR policies, etc.
-- Use the user context above to provide personalized responses
+- Use the user context above to provide personalized responses when available
+- If user data is not available, provide general assistance and suggest contacting HR
 - If you don't have specific information, be honest and suggest contacting HR
 - Be helpful, professional, and concise
 - Respond in plain text only (no markdown, no bullets)
+- Always maintain a friendly, helpful tone even when data is limited
 """
             
             messages = [
@@ -149,7 +157,7 @@ Instructions:
             ]
             
             response = await self.llm.ainvoke(messages)
-            logger.info(f"Processed RM query for {user_email}")
+            logger.info(f"Processed RM query for {user_email} (context: {'available' if user_context else 'fallback'})")
             return response.content.strip()
             
         except Exception as error:

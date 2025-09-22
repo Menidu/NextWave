@@ -431,31 +431,44 @@ class LeaveAgent:
             supervisor_chatspace = None
             
             if requester_email:
-                supervisor_chatspace = await self.rm_agent.get_supervisor_chatspace(requester_email)
+                try:
+                    supervisor_chatspace = await self.rm_agent.get_supervisor_chatspace(requester_email)
+                except Exception as e:
+                    logger.warning(f"Error retrieving supervisor chatspace: {e}")
             
             if supervisor_chatspace:
                 # Use supervisor's chatspace from database
                 dm_space = {"name": supervisor_chatspace}
                 logger.info(f"Using supervisor's chatspace from database: {supervisor_chatspace}")
             else:
-                # Fallback: Find any available space
-                spaces = chat_service.spaces().list(pageSize=100).execute().get('spaces', [])
-                dm_space = None
-                
-                # Try to find any available space
-                for space in spaces:
-                    if (
-                        isinstance(space, dict) and
-                        space.get('spaceType') in ('ROOM', 'SPACE', 'DIRECT_MESSAGE') and
-                        space.get('name')
-                    ):
-                        dm_space = space
-                        logger.info(f"Using fallback space: {space.get('name')}")
-                        break
-                
-                if not dm_space:
-                    logger.warning(f"No suitable space found for supervisor: {supervisor_email}")
-                    return "no_space_available"
+                # Fallback: Use requester's space if available
+                requester_space = leave_data.get("requesterSpaceName")
+                if requester_space:
+                    dm_space = {"name": requester_space}
+                    logger.info(f"Using requester's space as fallback: {requester_space}")
+                else:
+                    # Last resort: Find any available space
+                    try:
+                        spaces = chat_service.spaces().list(pageSize=100).execute().get('spaces', [])
+                        dm_space = None
+                        
+                        # Try to find any available space
+                        for space in spaces:
+                            if (
+                                isinstance(space, dict) and
+                                space.get('spaceType') in ('ROOM', 'SPACE', 'DIRECT_MESSAGE') and
+                                space.get('name')
+                            ):
+                                dm_space = space
+                                logger.info(f"Using generic fallback space: {space.get('name')}")
+                                break
+                        
+                        if not dm_space:
+                            logger.warning(f"No suitable space found for supervisor: {supervisor_email}")
+                            return "no_space_available"
+                    except Exception as e:
+                        logger.error(f"Error listing spaces: {e}")
+                        return "space_lookup_failed"
 
             # Build approval URLs
             base_url = os.getenv("APPROVAL_WEBHOOK_URL") or "http://localhost:3005"
